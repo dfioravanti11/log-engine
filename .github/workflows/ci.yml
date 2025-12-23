@@ -1,0 +1,143 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Cheapest check first: ten lines of grep that protect the whole simulator premise.
+  one-rule:
+    name: ER-1 (the one rule)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check_one_rule.sh
+
+  # The fast job. Budget: under 5 minutes total (NFR-6). If it creeps past that,
+  # move work to the nightly rather than letting every push get slower.
+  build-and-test:
+    name: ${{ matrix.preset }} / ${{ matrix.compiler }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [dev, asan, ubsan, tsan]
+        compiler: [clang]
+        include:
+          # A second frontend catches UB the first one silently accepts.
+          - preset: dev
+            compiler: gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake
+
+      - name: Select compiler
+        run: |
+          if [ "${{ matrix.compiler }}" = "gcc" ]; then
+            echo "CC=gcc-13" >> "$GITHUB_ENV"
+            echo "CXX=g++-13" >> "$GITHUB_ENV"
+          else
+            echo "CC=clang" >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} -j
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+
+  # The week 2 demo, run as a check. ER-6 says a week without a runnable demo isn't
+  # done; a demo that only ran once on the author's laptop is halfway to not runnable.
+  demo:
+    name: week 2 demo (kill -9 recovery)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build cmake
+      - run: cmake --preset dev
+      - run: cmake --build --preset dev -j
+      - run: ./scripts/demo_week2.sh 3
+
+  # Fuzzing the batch decoder — the parser that reads bytes off a disk that may have
+  # lied. Short run on every push to catch a broken harness; the long soak is nightly.
+  fuzz:
+    name: fuzz (batch decoder)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build cmake clang
+        env:
+          CC: clang
+          CXX: clang++
+      - run: cmake --preset fuzz
+        env:
+          CC: clang
+          CXX: clang++
+      - run: cmake --build --preset fuzz --target fuzz_batch_decode -j
+      - run: ./build/fuzz/tests/fuzz_batch_decode -max_total_time=60 -print_final_stats=1
+
+  # The determinism canary (I7). **Required check.** Same seed twice must produce a
+  # byte-identical event trace — it is the only thing standing between "deterministic"
+  # and "deterministic until someone iterates an unordered_map", and every correctness
+  # claim downstream of it (a bug that replays from its seed) depends on it holding.
+  #
+  # Runs the check twice over: once as a gtest that compares hashes and every observable
+  # total, and once through the binary that produces the traces a human would diff.
+  determinism:
+    name: determinism canary (I7)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build cmake
+      - run: cmake --preset dev
+      - run: cmake --build --preset dev -j
+
+      - name: Same seed twice, compared event by event
+        run: ctest --preset dev -R test_determinism --output-on-failure
+
+      - name: Diff two full traces of one seed
+        run: |
+          ./build/dev/tools/sim --seed 0x3f2a91c4 --duration-s 120 --dump-trace a.txt
+          ./build/dev/tools/sim --seed 0x3f2a91c4 --duration-s 120 --dump-trace b.txt
+          if ! diff -q a.txt b.txt; then
+            echo "::error::two runs of seed 0x3f2a91c4 diverge — first difference:"
+            diff a.txt b.txt | head -n 20
+            exit 1
+          fi
+          echo "identical: $(wc -l < a.txt) trace events"
+
+  # The fault sweep. 50 fixed seeds on every push stays inside the fast-job budget
+  # (NFR-6); the nightly soak explores seeds nobody would pick, which is where the
+  # interesting bugs come from (§18).
+  simulation:
+    name: simulation (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: fixed seeds
+            args: --seeds 50 --duration-s 30
+          - mode: hostile disk
+            args: --seeds 50 --duration-s 30 --io-errors 0.02
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build cmake
+      - run: cmake --preset dev
+      - run: cmake --build --preset dev --target tool_sim -j
+      # A failure prints its seed and the last 64 trace events, so the CI log alone is
+      # enough to reproduce it locally.
+      - run: ./build/dev/tools/sim ${{ matrix.args }}

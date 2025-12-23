@@ -1,0 +1,32 @@
+# Secrets — .env.example is committed, .env is not
+.env
+.env.local
+*.pem
+*.key
+
+# Build
+build/
+out/
+cmake-build-*/
+CMakeUserPresets.json
+vcpkg_installed/
+
+# Runtime data + artifacts
+data/
+artifacts/
+*.log.gz
+perf.data*
+*.svg.tmp
+
+# Fuzzing (corpus IS committed — crashes are not, until triaged)
+crash-*
+leak-*
+timeout-*
+oom-*
+
+# Editors / OS
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+.DS_Store
