@@ -14,6 +14,14 @@
 
 namespace storage {
 
+// One run of consecutive offsets written by a single leader — the leader epoch cache of
+// §12.3. Storage-level on purpose: `storage/` must not depend on `raft/`, so the term is
+// a `u32 epoch` here and `raft::Epoch` upstream.
+struct EpochBoundary {
+  base::u32 epoch = 0;
+  base::u64 start_offset = 0;
+};
+
 // The whole recovery story for one partition directory, aggregated across segments.
 struct LogRecoveryReport {
   base::u64 segments_opened = 0;
@@ -57,6 +65,37 @@ class Log {
   // offset assigned. The batch is in the page cache when this returns — durable only
   // after fsync(), which is the entire distinction `acks` is built on (§13).
   base::Result<base::u64> append(BatchBuilder& builder, const BatchMeta& meta);
+
+  // ---- The replication path (week 5) ----
+  //
+  // A follower does not get to choose offsets. The batch arriving from the leader already
+  // carries the offset the leader assigned, and it must land at exactly that offset with
+  // exactly those bytes — re-framing it here would change the CRC and break the identity
+  // that makes "these two nodes hold the same entry" checkable at all.
+  //
+  // So this is `append()` with the offset decision removed rather than delegated: the
+  // batch's own `base_offset` must equal `next_offset()`, and it is rejected otherwise.
+  // `Log` remains the offset authority for everything the *client* writes (I2); this is
+  // the one path where the authority sits upstream, in the leader.
+  base::Status append_replicated(base::Slice framed);
+
+  // Drops everything from `offset` onward. Used when a follower's tail diverged from the
+  // leader's (Raft §5.3) — those entries were never committed, by construction, because
+  // a committed entry cannot be missing from a leader's log (§5.4.1).
+  //
+  // Fails with kInvalidArgument if `offset` is below `start_offset()` or above
+  // `next_offset()`: truncating into reclaimed history, or past the end, is a bug in the
+  // caller and not something to paper over.
+  base::Status truncate_to(base::u64 offset);
+
+  // The leader epoch cache (§12.3, §16.1): one entry per change of `leader_epoch`, in
+  // offset order, rebuilt by scanning batch headers.
+  //
+  // Rebuilt rather than persisted, on purpose — it is derivable from the log, and a
+  // second durable structure is a second thing that can be wrong in a way the first one
+  // disagrees with. Raft needs it to answer "what term produced the entry at N?" without
+  // holding the entries.
+  [[nodiscard]] base::Result<std::vector<EpochBoundary>> scan_epochs() const;
 
   // Durable when this returns, for everything appended so far.
   base::Status fsync();

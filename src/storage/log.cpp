@@ -141,6 +141,73 @@ base::Result<base::u64> Log::append(BatchBuilder& builder, const BatchMeta& meta
   return base_offset;
 }
 
+base::Status Log::append_replicated(base::Slice framed) {
+  auto header = decode_header(framed);
+  if (!header) return base::fail(header.error());
+  if (framed.size() != header.value().total_bytes()) {
+    return base::fail(ErrorCode::kInvalidRequest);
+  }
+  // The leader chose this offset. If it does not continue our log exactly, the caller has
+  // a gap or an overlap it has not resolved — Raft's log matching exists precisely so
+  // that this never happens, so failing loudly here is how we find out it is broken.
+  if (header.value().base_offset != next_offset_) {
+    return base::fail(ErrorCode::kInvalidArgument);
+  }
+  // Bytes off a network, from a peer that may itself have read them off a bad disk. The
+  // CRC is checked before they are written rather than after they are read back.
+  if (!validate_batch(framed)) return base::fail(ErrorCode::kCorruptRecord);
+  if (framed.size() > options_.segment_max_bytes) {
+    return base::fail(ErrorCode::kMessageTooLarge);
+  }
+
+  Segment* active = segments_.back().get();
+  if (!active->empty() &&
+      framed.size() > options_.segment_max_bytes - active->size_bytes()) {
+    if (auto st = roll(); !st) return base::fail(st.error());
+    active = segments_.back().get();
+  }
+
+  if (auto st = active->append(framed, header.value()); !st) return base::fail(st.error());
+  next_offset_ = header.value().next_offset();
+  return {};
+}
+
+base::Status Log::truncate_to(base::u64 offset) {
+  if (offset > next_offset_) return base::fail(ErrorCode::kInvalidArgument);
+  if (offset < start_offset_) return base::fail(ErrorCode::kInvalidArgument);
+  if (offset == next_offset_) return {};
+
+  // Drop whole segments that begin at or after the cut, newest first, then cut into the
+  // one that straddles it. Never drop the last segment outright: a log with no segment
+  // has nowhere to put the next append, and `segments_.back()` is assumed live
+  // everywhere else in this file.
+  while (segments_.size() > 1 && segments_.back()->base_offset() >= offset) {
+    const base::u64 base = segments_.back()->base_offset();
+    segments_.pop_back();
+    remove_segment_files(base);
+  }
+
+  if (auto st = segments_.back()->truncate_to(offset); !st) return base::fail(st.error());
+  next_offset_ = segments_.back()->next_offset();
+  return {};
+}
+
+base::Result<std::vector<EpochBoundary>> Log::scan_epochs() const {
+  std::vector<EpochBoundary> epochs;
+  for (const auto& segment : segments_) {
+    auto st = segment->scan_headers([&epochs](const BatchHeader& header) {
+      // One boundary per *change* of epoch. A million batches from one leader is one
+      // entry, which is the whole reason this structure is affordable to rebuild.
+      if (epochs.empty() || epochs.back().epoch != header.leader_epoch) {
+        epochs.push_back(EpochBoundary{header.leader_epoch, header.base_offset});
+      }
+      return true;
+    });
+    if (!st) return base::fail(st.error());
+  }
+  return epochs;
+}
+
 base::Status Log::fsync() { return segments_.back()->fsync(); }
 
 base::Result<std::size_t> Log::read(base::u64 offset, base::MutSlice out) const {

@@ -279,6 +279,65 @@ base::Result<std::size_t> Segment::read(base::u64 offset, base::MutSlice out) co
   return whole;
 }
 
+base::Status Segment::scan_headers(
+    const std::function<bool(const BatchHeader&)>& visit) const {
+  base::u32 pos = 0;
+  while (pos < size_bytes_) {
+    base::u8 header_bytes[kBatchHeaderBytes];
+    auto got = disk_.pread(log_file_, base::MutSlice(header_bytes, kBatchHeaderBytes), pos);
+    if (!got) return base::fail(got.error());
+    if (got.value() < kBatchHeaderBytes) return base::fail(ErrorCode::kCorruptRecord);
+
+    auto header = decode_header(base::Slice(header_bytes, kBatchHeaderBytes));
+    if (!header) return base::fail(ErrorCode::kCorruptRecord);
+
+    if (!visit(header.value())) return {};
+    pos += static_cast<base::u32>(header.value().total_bytes());
+  }
+  return {};
+}
+
+base::Status Segment::truncate_to(base::u64 offset) {
+  if (offset >= next_offset_) return {};  // nothing of ours is past it
+
+  // Walk to the batch that begins at `offset`. The index bounds the scan the same way it
+  // does on the read path — it never answers the question, it only says where to start.
+  base::u32 pos = 0;
+  if (offset > base_offset_) {
+    pos = index_.lookup(static_cast<base::u32>(offset - base_offset_)).file_pos;
+  }
+
+  base::u32 cut = pos;
+  bool found = offset <= base_offset_;
+  while (!found && pos < size_bytes_) {
+    base::u8 header_bytes[kBatchHeaderBytes];
+    auto got = disk_.pread(log_file_, base::MutSlice(header_bytes, kBatchHeaderBytes), pos);
+    if (!got) return base::fail(got.error());
+    if (got.value() < kBatchHeaderBytes) return base::fail(ErrorCode::kCorruptRecord);
+
+    auto header = decode_header(base::Slice(header_bytes, kBatchHeaderBytes));
+    if (!header) return base::fail(ErrorCode::kCorruptRecord);
+
+    if (header.value().base_offset == offset) {
+      cut = pos;
+      found = true;
+      break;
+    }
+    // Cutting into the middle of a batch would leave a record half-present, which is a
+    // worse state than either keeping or dropping the whole thing. Raft only ever names
+    // a batch boundary, so if we walked past one the caller is confused.
+    if (header.value().base_offset > offset) return base::fail(ErrorCode::kInvalidArgument);
+    pos += static_cast<base::u32>(header.value().total_bytes());
+  }
+  if (!found) return base::fail(ErrorCode::kInvalidArgument);
+
+  if (auto st = disk_.truncate(log_file_, cut); !st) return base::fail(st.error());
+  size_bytes_ = cut;
+  next_offset_ = offset;
+  index_.truncate_from(cut);
+  return {};
+}
+
 base::Status Segment::flush_index() {
   base::Buffer out;
   index_.encode(out);

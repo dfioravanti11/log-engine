@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -68,6 +69,20 @@ class Segment {
   // consumer that treats "your buffer is too small" as "you're caught up" stalls
   // forever.
   base::Result<std::size_t> read(base::u64 offset, base::MutSlice out) const;
+
+  // Drops every batch from `offset` onward, shrinking the file to the byte position where
+  // that batch began. `offset` must be a batch boundary this segment actually contains,
+  // or one past the end (in which case nothing happens).
+  //
+  // Unlike recovery's truncation — which cuts at the first thing that *fails to decode* —
+  // this one cuts at a boundary the caller names, because Raft knows which entries
+  // diverged and the bytes themselves are perfectly valid.
+  base::Status truncate_to(base::u64 offset);
+
+  // Walks every batch header in the segment, cheaply, without copying record payloads.
+  // `visit` sees each batch's base offset and leader epoch in order; returning false
+  // stops the walk.
+  base::Status scan_headers(const std::function<bool(const BatchHeader&)>& visit) const;
 
   // Writes the index sidecar. Called at roll and at close — never fsynced.
   base::Status flush_index();
