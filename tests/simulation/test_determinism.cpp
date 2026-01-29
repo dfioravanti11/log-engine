@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "sim/simulation.h"
+#include "support/build_mode.h"
 
 // **I7 — the same seed produces a byte-identical event trace.**
 //
@@ -19,7 +20,9 @@
 // So it is tested, on every push, and when it fails the two traces get diffed.
 namespace {
 
-sim::SimulationConfig config_for(base::u64 seed, base::Nanos duration = base::seconds(20)) {
+sim::SimulationConfig config_for(
+    base::u64 seed,
+    base::Nanos duration = tests::sim_ns(base::seconds(20), base::seconds(6))) {
   sim::SimulationConfig config;
   config.seed = seed;
   config.node_count = 3;
@@ -49,7 +52,7 @@ TEST(Determinism, SameSeedProducesTheSameTraceHash) {
 // stable because the seed is being ignored would pass every test above.
 TEST(Determinism, DifferentSeedsProduceDifferentRuns) {
   std::vector<base::u64> hashes;
-  for (base::u64 seed = 1; seed <= 8; ++seed) {
+  for (base::u64 seed = 1; seed <= tests::seeds(8, 4); ++seed) {
     hashes.push_back(sim::run_simulation(config_for(seed)).trace_hash);
   }
   for (std::size_t i = 0; i < hashes.size(); ++i) {
@@ -113,8 +116,26 @@ TEST(Simulator, FaultsActuallyFire) {
   base::u64 unflushed_lost = 0;
   base::u64 resets = 0;
 
-  for (base::u64 seed = 1; seed <= 10; ++seed) {
-    const sim::SimulationResult result = sim::run_simulation(config_for(seed));
+  // Faults that fire *promptly*, rather than a long run that eventually meets the default
+  // intervals. That distinction has teeth: shortening this file's runs for instrumented
+  // builds dropped them below the 20 s default crash interval, and this test immediately
+  // went red with four zeroes — which is precisely its job. A check that stops checking
+  // because somebody tuned an unrelated knob is the failure mode the whole file is about.
+  // Full length in every build, unlike the rest of this file. Unflushed-write loss needs a
+  // crash to land in the window between a write and its fsync, and week 5 made that window
+  // narrow — every append is fsynced, and so is every replicated entry. Shortening the run
+  // here would not make the test faster in any way that matters; it would make it stop
+  // being able to observe the one fault it exists to prove is real.
+  auto config_for_faults = [](base::u64 seed) {
+    sim::SimulationConfig config = config_for(seed, base::seconds(20));
+    config.faults.crash_interval = base::seconds(2);
+    config.faults.partition_interval = base::seconds(2);
+    config.faults.partition_duration_max = base::seconds(1);
+    return config;
+  };
+
+  for (base::u64 seed = 1; seed <= tests::seeds(10, 4); ++seed) {
+    const sim::SimulationResult result = sim::run_simulation(config_for_faults(seed));
     crashes += result.crashes;
     partitions += result.partitions;
     unflushed_lost += result.bytes_lost_to_crashes;
@@ -141,29 +162,33 @@ TEST(Simulator, FaultsActuallyFire) {
 // deterministic, so the I7 canary was green throughout: **determinism is not
 // correctness, it only makes correctness checkable.**
 TEST(Simulator, EveryNodeDoesItsShareOfTheWork) {
-  sim::SimulationConfig config = config_for(2024, base::seconds(30));
+  sim::SimulationConfig config =
+      config_for(2024, tests::sim_ns(base::seconds(30), base::seconds(10)));
   config.node_count = 4;
   config.faults.crash_interval = 0;
   config.faults.partition_interval = 0;
 
   const sim::SimulationResult result = sim::run_simulation(config);
   ASSERT_TRUE(result.ok) << result.detail;
-  ASSERT_EQ(result.batches_per_node.size(), 4u);
+  ASSERT_EQ(result.ticks_per_node.size(), 4u);
 
   const base::u64 most =
-      *std::max_element(result.batches_per_node.begin(), result.batches_per_node.end());
+      *std::max_element(result.ticks_per_node.begin(), result.ticks_per_node.end());
   const base::u64 least =
-      *std::min_element(result.batches_per_node.begin(), result.batches_per_node.end());
+      *std::min_element(result.ticks_per_node.begin(), result.ticks_per_node.end());
   ASSERT_GT(least, 0u);
 
-  // Jitter is ±20 ms on a 40 ms interval, so a few percent of spread is expected and
-  // anything past 15% means a node is being paced by something other than its own timer.
-  EXPECT_LE(static_cast<double>(most - least) / static_cast<double>(most), 0.15)
-      << "node work is lopsided: " << least << " vs " << most << " batches";
+  // Raft ticks, not appends. Week 5 made only the leader append, so append counts now
+  // measure who won elections rather than who is being scheduled — and this test is about
+  // scheduling. Every node runs its tick timer on the same fixed interval with no jitter
+  // at all, so the spread should be tiny; 5% leaves room for the partial interval at the
+  // end of the run without leaving room for a node running at two-thirds speed.
+  EXPECT_LE(static_cast<double>(most - least) / static_cast<double>(most), 0.05)
+      << "node scheduling is lopsided: " << least << " vs " << most << " ticks";
 }
 
 TEST(Simulator, AckedWritesSurviveEverySeed) {
-  for (base::u64 seed = 1; seed <= 50; ++seed) {
+  for (base::u64 seed = 1; seed <= tests::seeds(50, 5); ++seed) {
     const sim::SimulationResult result = sim::run_simulation(config_for(seed));
     ASSERT_TRUE(result.ok) << "seed=" << seed << " violated "
                            << (result.invariant != nullptr ? result.invariant : "?") << ": "
@@ -173,24 +198,11 @@ TEST(Simulator, AckedWritesSurviveEverySeed) {
 }
 
 // A wall-clock assertion is only meaningful in an optimized, uninstrumented build.
-// Under ASan/UBSan/TSan the same hour takes ~35× longer, and asserting a time bound
-// there measures the sanitizer rather than the simulator — a test that fails for a
-// reason it is not about is worse than no test.
-constexpr bool kTimingIsMeaningful =
-#if defined(NDEBUG) && !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__)
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
-    __has_feature(memory_sanitizer)
-    false;
-#else
-    true;
-#endif
-#else
-    true;
-#endif
-#else
-    false;
-#endif
+// Under ASan/UBSan/TSan the same hour takes far longer, and asserting a time bound there
+// measures the sanitizer rather than the simulator — a test that fails for a reason it is
+// not about is worse than no test. The detection lives in one place now, because week 4
+// needed the same distinction for a different reason (`tests/support/build_mode.h`).
+constexpr bool kTimingIsMeaningful = tests::kOptimizedUninstrumented;
 
 // NFR-4: at least one simulated cluster-hour per five wall-clock seconds. The bound is
 // deliberately loose — this runs on whatever CI machine is free — but a 10× regression
@@ -200,7 +212,7 @@ TEST(Simulator, SimulatesAnHourFastEnoughToBeWorthRunning) {
   // A full hour under a sanitizer takes minutes and proves nothing the shorter run does
   // not — the stopwatch is already meaningless there, so paying for the long version
   // only buys a CI timeout.
-  const base::Nanos duration = kTimingIsMeaningful ? base::seconds(3600) : base::seconds(120);
+  const base::Nanos duration = kTimingIsMeaningful ? base::seconds(3600) : base::seconds(20);
   sim::SimulationConfig config = config_for(11, duration);
 
   const auto started = std::chrono::steady_clock::now();

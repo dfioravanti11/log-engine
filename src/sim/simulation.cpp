@@ -65,7 +65,7 @@ void Simulation::boot(Node& node) {
   std::vector<NodeWorkload::Peer> peers;
   for (const auto& other : nodes_) {
     if (other->id == node.id) continue;
-    peers.push_back(NodeWorkload::Peer{node_name(other->id), other->port});
+    peers.push_back(NodeWorkload::Peer{node_name(other->id), other->port, other->id});
   }
 
   node.workload = std::make_unique<NodeWorkload>(node.id, scheduler_, *node.loop, *node.disk,
@@ -98,7 +98,8 @@ void Simulation::crash_node(base::u32 id) {
   // Take the counters before the process that owns them is destroyed. Reading them off
   // the live workloads at the end would only ever report the last generation, and a run
   // with five hundred crashes would claim it did almost no work.
-  pongs_ += node.workload->pongs();
+  raft_messages_ += node.workload->raft_messages_sent();
+  hard_state_writes_ += node.workload->hard_state_writes();
   node.workload.reset();
   node.loop.reset();
   node.up = false;
@@ -249,16 +250,27 @@ SimulationResult Simulation::snapshot(bool completed) const {
   result.simulated_time = completed ? config_.duration : scheduler_.now();
   result.node_count = config_.node_count;
 
-  // Batches come from the oracle rather than the workloads: the oracle outlives every
-  // crash, and the workloads do not.
-  result.records_acked = oracle_.total_records();
-  result.appends = oracle_.total_batches();
-  result.pongs = pongs_;
-  for (base::u32 id = 0; id < config_.node_count; ++id) {
-    result.batches_per_node.push_back(static_cast<base::u64>(oracle_.acks(id).size()));
-  }
+  // From the oracle rather than the workloads: the oracle outlives every crash, and the
+  // workloads do not. With replication an "acked" record is one below the commit index —
+  // a promise the *cluster* made, which outlives the leader that made it.
+  result.records_acked = oracle_.committed_end();
+  result.appends = oracle_.commits();
+  result.raft_messages = raft_messages_;
+  result.hard_state_writes = hard_state_writes_;
+  // Elections and the term ceiling likewise: a leader that won and was crashed before
+  // anybody saw it still won, and the oracle is the only thing that remembers.
+  result.elections = oracle_.elections();
+  result.highest_term = oracle_.highest_term();
+  result.longest_leaderless = oracle_.longest_leaderless();
+  result.leaderless_gaps = oracle_.leaderless_gaps();
+  result.ticks_per_node.assign(config_.node_count, 0);
   for (const auto& node : nodes_) {
-    if (node->workload != nullptr) result.pongs += node->workload->pongs();
+    if (node->workload != nullptr) {
+      result.raft_messages += node->workload->raft_messages_sent();
+      result.hard_state_writes += node->workload->hard_state_writes();
+      result.ticks_per_node[node->id] += node->workload->ticks();
+      if (node->workload->is_leader()) ++result.leaders_at_end;
+    }
     result.bytes_lost_to_crashes += node->disk->bytes_lost_on_crash();
   }
   result.crashes = crashes_;
@@ -311,6 +323,24 @@ SimulationResult Simulation::run() {
     if (!oracle_.ok()) break;
 
     drain_nodes();
+
+    // **I8 — liveness.** Sampled once per instant the clock lands on, which is every
+    // instant anything happens, so a leaderless stretch is measured to the resolution of
+    // the events that could have ended it. Cheap: it is a walk over three pointers.
+    bool any_leader = false;
+    std::size_t alive = 0;
+    for (const auto& node : nodes_) {
+      if (!node->up || node->workload == nullptr) continue;
+      ++alive;
+      if (node->workload->is_leader()) any_leader = true;
+    }
+    if (any_leader) {
+      oracle_.note_leader_present(scheduler_.now());
+    } else {
+      oracle_.note_leader_absent(scheduler_.now());
+      // No majority alive means no leader is *correct*, so this stretch is not a failover.
+      if (alive < nodes_.size() / 2 + 1) oracle_.note_quorum_lost();
+    }
 
     if (config_.max_events != 0 && scheduler_.events_run() >= config_.max_events) break;
   }

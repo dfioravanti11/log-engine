@@ -3,19 +3,11 @@
 #include <algorithm>
 #include <utility>
 
-#include "base/endian.h"
 
 namespace sim {
 namespace {
 
 using base::Slice;
-
-// api_version doubles as the message type. Two values do not justify a second enum, and
-// having it in the frame header means a trace of the wire is readable without decoding
-// the payload.
-constexpr base::u16 kPing = 0;
-constexpr base::u16 kPong = 1;
-constexpr std::size_t kPayloadBytes = 8;  // the sender's next offset
 
 std::string describe(base::u32 node, const char* what, base::u64 a, base::u64 b) {
   return "node " + std::to_string(node) + ": " + what + " (" + std::to_string(a) + ", " +
@@ -50,11 +42,62 @@ void Oracle::violation(const char* invariant, std::string detail) {
   detail_ = std::move(detail);
 }
 
-std::string payload_for(base::u32 node, base::u64 offset) {
-  std::string value = "n" + std::to_string(node) + "-r" + std::to_string(offset) + "-";
+void Oracle::record_commit(base::u64 end) {
+  if (end <= committed_end_) return;
+  committed_end_ = end;
+  ++commits_;
+}
+
+void Oracle::note_leader_present(base::Nanos at) {
+  if (leader_present_) return;
+  const base::Nanos gap = at - leaderless_since_;
+  if (gap > longest_gap_) longest_gap_ = gap;
+  // Only a stretch during which a majority was continuously alive is a *failover*. The
+  // rest are the cluster correctly declining to elect anybody, and averaging those in
+  // measures the fault injector's restart delay rather than the algorithm.
+  if (gap_had_quorum_) gaps_.push_back(gap);
+  leader_present_ = true;
+}
+
+void Oracle::note_leader_absent(base::Nanos at) {
+  if (!leader_present_) return;
+  leader_present_ = false;
+  leaderless_since_ = at;
+  gap_had_quorum_ = true;
+}
+
+void Oracle::check_leader_completeness(base::u32 node, base::u64 log_end) {
+  if (log_end >= committed_end_) return;
+  violation("I1", describe(node, "won an election without the committed prefix", log_end,
+                           committed_end_));
+}
+
+void Oracle::record_leader(raft::Term term, raft::NodeId node) {
+  observe_term(term);
+  const auto [it, inserted] = leader_by_term_.emplace(term, node);
+  if (inserted) {
+    ++elections_;
+    return;
+  }
+  if (it->second == node) return;  // the same node re-observed, which is not an election
+
+  // **I6 — at most one leader per term.** Two nodes each counted a majority of the same
+  // cluster in the same term, which is arithmetically impossible unless somebody voted
+  // twice — so the cause is upstream: a lost vote across a crash, an fsync that was
+  // skipped, or a response sent before the write landed (§13).
+  violation("I6", "term " + std::to_string(term) + " has two leaders: node " +
+                      std::to_string(it->second) + " and node " + std::to_string(node));
+}
+
+std::string payload_for(base::u64 offset) {
+  // Keyed on the offset alone, not the node. With replication there is one log and every
+  // node must hold identical bytes at a given offset — a payload that varied by node
+  // would make "these two nodes agree" unaskable.
+  std::string value = "r" + std::to_string(offset) + "-";
   value.resize(48, '.');
   return value;
 }
+
 
 NodeWorkload::NodeWorkload(base::u32 node, Scheduler& scheduler, runtime::EventLoop& loop,
                            io::Disk& disk, io::Random& rng, Oracle& oracle, std::string dir,
@@ -68,104 +111,57 @@ NodeWorkload::NodeWorkload(base::u32 node, Scheduler& scheduler, runtime::EventL
       dir_(std::move(dir)),
       port_(port),
       peers_(std::move(peers)),
-      config_(config) {
-  peer_conns_.assign(peers_.size(), io::kInvalidConn);
-}
+      config_(config) {}
 
 NodeWorkload::~NodeWorkload() = default;
 
 base::Status NodeWorkload::start() {
-  storage::Log::Options options;
-  // Small segments so an hour of simulated life rolls them many times. Rolling is on
-  // the durability path, and a fault injector that never crosses a roll boundary is
-  // not testing the interesting half of recovery.
-  options.segment_max_bytes = 32u * 1024u;
+  server::BrokerConfig broker_config;
+  broker_config.id = node_;
+  broker_config.data_dir = dir_;
+  broker_config.port = port_;
+  broker_config.peers = peers_;
+  broker_config.tick_interval = config_.raft_tick;
+  broker_config.election_timeout_ticks = config_.election_timeout_ticks;
+  broker_config.election_timeout_jitter_ticks = config_.election_timeout_jitter_ticks;
+  broker_config.heartbeat_timeout_ticks = config_.heartbeat_timeout_ticks;
+  broker_config.fsync_hard_state = config_.fsync_hard_state;
+  broker_config.ack_on_local_append = config_.ack_on_local_append;
+  // Small segments so an hour of simulated life rolls them many times. Rolling is on the
+  // durability path, and a fault injector that never crosses a roll boundary is not
+  // testing the interesting half of recovery.
+  broker_config.segment_max_bytes = 32u * 1024u;
 
-  auto opened = storage::Log::open(disk_, dir_, options);
-  if (!opened) return base::fail(opened.error());
-  log_ = std::move(opened).value();
-
-  const storage::LogRecoveryReport& report = log_->recovery();
-  scheduler_.record(EventTag{EventKind::kRecovered, node_, log_->next_offset(),
-                             report.bytes_truncated});
-
-  verify_recovery();
-  if (!oracle_.ok()) return {};
-
-  auto listener = loop_.network().listen(port_, 16);
-  if (listener) {
-    listener_ = listener.value();
-    loop_.network().watch(listener_, io::Interest::kRead, this);
+  broker_ = std::make_unique<server::Broker>(std::move(broker_config), loop_, disk_, rng_,
+                                             this);
+  if (auto started = broker_->start(); !started) {
+    broker_.reset();
+    return base::fail(started.error());
   }
+  if (!oracle_.ok()) return {};
 
   running_ = true;
   schedule_append();
-  schedule_ping();
   return {};
 }
 
-void NodeWorkload::verify_recovery() {
-  const std::vector<AckedBatch>& acks = oracle_.acks(node_);
-  if (acks.empty()) return;
-
-  // **I1 — an acked write is never lost.**
-  //
-  // One comparison, not a scan of an hour's worth of records. Recovery always yields a
-  // *prefix* of what was written — week 2's property test establishes that
-  // independently, over every truncation point — so a log that still reaches the
-  // highest acked offset necessarily still contains every acked offset below it.
-  // Re-reading all of them on every restart would turn the run quadratic and prove
-  // nothing extra.
-  const base::u64 promised = oracle_.acked_end(node_);
-  if (log_->next_offset() < promised) {
-    oracle_.violation("I1", describe(node_, "log ends below the highest acked offset",
-                                     log_->next_offset(), promised));
-    return;
-  }
-
-  // The prefix argument covers presence; it says nothing about *content*. Spot-check
-  // the newest batches, which is where a torn tail would have bitten.
-  const std::size_t window = std::min(config_.verify_tail_batches, acks.size());
-  std::vector<base::u8> buffer(64u * 1024u);
-
-  for (std::size_t i = acks.size() - window; i < acks.size(); ++i) {
-    const AckedBatch& batch = acks[i];
-    auto got = log_->read(batch.base_offset, base::MutSlice(buffer.data(), buffer.size()));
-    if (!got && got.error() == base::ErrorCode::kIoError) {
-      // The disk declined to answer. That is not evidence the record is gone — the
-      // offset check above already established presence from durable state, and this
-      // walk is only about content. Inconclusive, not violated. Calling it a violation
-      // here would make the checker report a data-loss bug every time a simulated read
-      // hiccuped, and a checker that cries wolf gets ignored exactly once.
-      return;
-    }
-    if (!got || got.value() == 0) {
-      oracle_.violation("I1", describe(node_, "acked offset is unreadable after recovery",
-                                       batch.base_offset, batch.record_count));
-      return;
-    }
-
-    const Slice framed(buffer.data(), got.value());
-    auto header = storage::decode_header(framed);
-    if (!header || header.value().base_offset != batch.base_offset) {
-      oracle_.violation("I1", describe(node_, "read at an acked offset returned another batch",
-                                       batch.base_offset, 0));
-      return;
-    }
-
-    storage::RecordIterator records(framed);
-    Slice value;
-    base::u64 offset = batch.base_offset;
-    while (records.next(&value)) {
-      if (value != Slice::from_string(payload_for(node_, offset))) {
-        oracle_.violation("I1", describe(node_, "acked record holds bytes never written",
-                                         offset, 0));
-        return;
-      }
-      ++offset;
-    }
-  }
+base::u64 NodeWorkload::appends() const noexcept {
+  return broker_ != nullptr ? broker_->appends() : 0;
 }
+base::u64 NodeWorkload::raft_messages_sent() const noexcept {
+  return broker_ != nullptr ? broker_->raft_messages_sent() : 0;
+}
+base::u64 NodeWorkload::hard_state_writes() const noexcept {
+  return broker_ != nullptr ? broker_->hard_state_writes() : 0;
+}
+base::u64 NodeWorkload::ticks() const noexcept {
+  return broker_ != nullptr ? broker_->ticks() : 0;
+}
+bool NodeWorkload::is_leader() const noexcept {
+  return broker_ != nullptr && broker_->is_leader();
+}
+
+// ---- The load generator ----
 
 void NodeWorkload::schedule_append() {
   if (!running_) return;
@@ -174,217 +170,183 @@ void NodeWorkload::schedule_append() {
 }
 
 void NodeWorkload::do_append() {
-  if (!running_ || log_ == nullptr) return;
+  if (!running_ || broker_ == nullptr) return;
 
-  const base::u64 expected = log_->next_offset();
+  storage::Log* log = broker_->log();
+  if (log == nullptr) return;
+
+  const base::u64 expected = log->next_offset();
   builder_.clear();
   for (base::u32 i = 0; i < config_.records_per_batch; ++i) {
-    const std::string value = payload_for(node_, expected + i);
+    const std::string value = payload_for(expected + i);
     if (!builder_.add_record(Slice::from_string(value))) {
       schedule_append();
       return;
     }
   }
 
-  auto assigned = log_->append(builder_, storage::BatchMeta{});
+  // Sampled *before* the append, because under `acks=1` the append commits itself: the
+  // broker records the promise inside propose(), so reading the oracle afterwards would
+  // compare this offset against a commit index it had just advanced, and every single
+  // append would look like a regression. (It did, on the first run after the driver moved
+  // into `server/` — the checker caught the refactor, which is the checker working.)
+  const base::u64 committed_before = oracle_.committed_end();
+
+  auto assigned = broker_->propose(builder_);
   if (!assigned) {
-    // A simulated I/O error. The batch is not acked, so nothing was promised and
-    // nothing is owed — retry on the next tick, exactly as a broker would.
+    // Not the leader, or the disk refused. Nothing was promised and nothing is owed —
+    // retry on the next tick, exactly as a producer would after NOT_LEADER.
     schedule_append();
     return;
   }
 
-  // **I2 — offsets are monotonic in commit order.** The log is the only thing that
-  // assigns them, so a regression here means recovery handed back a next_offset below
-  // one already acked — which is the same failure as losing the record, seen earlier.
-  if (assigned.value() < oracle_.acked_end(node_)) {
+  // **I2 — offsets are monotonic.** A regression here means recovery handed back a
+  // next_offset below something already committed.
+  if (assigned.value() < committed_before) {
     oracle_.violation("I2", describe(node_, "offset went backwards after recovery",
-                                     assigned.value(), oracle_.acked_end(node_)));
+                                     assigned.value(), committed_before));
     return;
   }
-  scheduler_.record(EventTag{EventKind::kAppend, node_, assigned.value(),
-                             config_.records_per_batch});
-
-  if (auto flushed = log_->fsync(); !flushed) {
-    // Appended but not durable. Deliberately *not* acked: the whole durability
-    // argument (§13) is that the response waits for the platter, and a simulator that
-    // acked here would agree with the bug it exists to find.
-    schedule_append();
-    return;
-  }
-  scheduler_.record(EventTag{EventKind::kFsync, node_, log_->next_offset(), 0});
-
-  oracle_.record_ack(node_, AckedBatch{assigned.value(), config_.records_per_batch});
-  scheduler_.record(EventTag{EventKind::kAck, node_, assigned.value(),
-                             config_.records_per_batch});
-  ++appends_;
   schedule_append();
 }
 
-void NodeWorkload::schedule_ping() {
-  if (!running_) return;
-  loop_.add_timer_after(config_.ping_interval, [this] { do_ping(); });
+// ---- BrokerObserver: watching, never deciding ----
+
+void NodeWorkload::on_log_recovered(base::u64 next_offset, base::u64 bytes_truncated) {
+  scheduler_.record(EventTag{EventKind::kRecovered, node_, next_offset, bytes_truncated});
+  verify_recovery();
 }
 
-void NodeWorkload::do_ping() {
-  if (!running_) return;
+void NodeWorkload::on_raft_recovered(raft::Term term, raft::NodeId voted_for) {
+  oracle_.observe_term(term);
+  scheduler_.record(EventTag{EventKind::kRaftRecover, node_, term, voted_for});
+  scheduler_.record(EventTag{EventKind::kRestart, node_, 0, 0});
+}
 
-  for (std::size_t i = 0; i < peers_.size(); ++i) {
-    if (peer_conns_[i] == io::kInvalidConn) {
-      auto conn = loop_.network().connect(peers_[i].host, peers_[i].port);
-      if (!conn) continue;  // partitioned or nobody listening; try again next tick
-      peer_conns_[i] = conn.value();
-      Stream& stream = streams_[conn.value()];
-      stream.outgoing = true;
-      loop_.network().watch(conn.value(), io::Interest::kRead, this);
+void NodeWorkload::on_appended(base::u64 base_offset, base::u32 records) {
+  scheduler_.record(EventTag{EventKind::kAppend, node_, base_offset, records});
+}
+
+void NodeWorkload::on_fsynced(base::u64 next_offset) {
+  scheduler_.record(EventTag{EventKind::kFsync, node_, next_offset, 0});
+}
+
+void NodeWorkload::on_replicated(base::u64 next_offset) {
+  scheduler_.record(EventTag{EventKind::kReplicate, node_, next_offset, 0});
+}
+
+void NodeWorkload::on_truncated(base::u64 from) {
+  scheduler_.record(EventTag{EventKind::kTruncate, node_, from, 0});
+}
+
+void NodeWorkload::on_committed(base::u64 from, base::u64 to) {
+  // Everything newly below the commit index is a promise the cluster has now made,
+  // recorded once cluster-wide by whichever node noticed first. The oracle outlives the
+  // leader that made it, which is the entire point of the promise being checkable after
+  // that leader has been destroyed by a crash.
+  oracle_.record_commit(to);
+  for (base::u64 offset = from; offset < to; ++offset) {
+    scheduler_.record(EventTag{EventKind::kCommit, node_, offset, 0});
+  }
+}
+
+void NodeWorkload::on_campaign(raft::Term term) {
+  oracle_.observe_term(term);
+  scheduler_.record(EventTag{EventKind::kCampaign, node_, term, 0});
+}
+
+void NodeWorkload::on_vote(raft::Term term, raft::NodeId candidate) {
+  oracle_.observe_term(term);
+  scheduler_.record(EventTag{EventKind::kVote, node_, term, candidate});
+}
+
+void NodeWorkload::on_became_leader(raft::Term term, base::u64 log_end) {
+  oracle_.observe_term(term);
+  scheduler_.record(EventTag{EventKind::kLeader, node_, term, 0});
+  oracle_.record_leader(term, node_);
+  // The moment §5.4.1 promises this node holds every committed entry. If it does not, the
+  // election safety argument is broken, not merely the data.
+  oracle_.check_leader_completeness(node_, log_end);
+}
+
+void NodeWorkload::on_stepped_down(raft::Term term, raft::NodeId leader) {
+  oracle_.observe_term(term);
+  scheduler_.record(EventTag{EventKind::kStepDown, node_, term, leader});
+}
+
+void NodeWorkload::on_hard_state_persisted(raft::Term term, raft::NodeId voted_for) {
+  scheduler_.record(EventTag{EventKind::kRaftPersist, node_, term, voted_for});
+}
+
+void NodeWorkload::on_protocol_error(const char* what, base::u64 a, base::u64 b) {
+  oracle_.violation("FRAMING", describe(node_, what, a, b));
+}
+
+void NodeWorkload::verify_recovery() {
+  // **I1 and I4, in their replicated form.**
+  //
+  // Week 4 could make a much stronger local claim: every node acked its own writes, so its
+  // log had to reach its own highest acked offset or something was lost. With replication
+  // that is no longer true of any individual node — a follower is *supposed* to lag.
+  //
+  // What is still true of every node, always, is that whatever committed prefix it does
+  // hold must be **byte-identical** to what the cluster committed. A follower may be
+  // short; it may never be different. That is the Log Matching Property (§5.3) checked
+  // from outside, and it catches truncation-to-the-wrong-place, a replicated batch landing
+  // at the wrong offset, and silent corruption of committed data.
+  //
+  // The other half — a *leader* may not be short — is checked at election time by
+  // Oracle::check_leader_completeness(), because that is the moment §5.4.1 promises it.
+  storage::Log* log = broker_ != nullptr ? broker_->log() : nullptr;
+  if (log == nullptr) return;
+
+  const base::u64 verifiable = std::min(oracle_.committed_end(), log->next_offset());
+  if (verifiable == 0) return;
+
+  // Only the tail. Recovery always yields a prefix (week 2's property test establishes
+  // that independently, over every truncation point), so re-reading an hour of records on
+  // every restart would make the run quadratic and prove nothing extra.
+  const base::u64 window = static_cast<base::u64>(config_.verify_tail_batches) *
+                           std::max(config_.records_per_batch, 1u);
+  base::u64 offset = verifiable > window ? verifiable - window : 0;
+  if (offset < log->start_offset()) offset = log->start_offset();
+
+  std::vector<base::u8> buffer(64u * 1024u);
+  while (offset < verifiable) {
+    auto got = log->read(offset, base::MutSlice(buffer.data(), buffer.size()));
+    if (!got && got.error() == base::ErrorCode::kIoError) {
+      // The disk declined to answer. Not evidence anything is gone, and a checker that
+      // cries wolf gets ignored exactly once. Inconclusive, not violated.
+      return;
+    }
+    if (!got || got.value() == 0) {
+      oracle_.violation("I1", describe(node_, "committed offset is unreadable after recovery",
+                                       offset, verifiable));
+      return;
     }
 
-    const io::ConnId conn = peer_conns_[i];
-    const base::u32 correlation = next_correlation_++;
-    streams_[conn].awaiting.insert(correlation);
+    const Slice framed(buffer.data(), got.value());
+    auto header = storage::decode_header(framed);
+    if (!header) {
+      oracle_.violation("I1", describe(node_, "committed offset holds an undecodable batch",
+                                       offset, 0));
+      return;
+    }
 
-    base::u8 payload[kPayloadBytes];
-    base::store_u64_le(payload, log_ != nullptr ? log_->next_offset() : 0);
-
-    scheduler_.record(EventTag{EventKind::kPing, node_, i, correlation});
-    send(conn, wire::FrameHeader{wire::ApiKey::kEcho, kPing, correlation},
-         Slice(payload, kPayloadBytes));
-  }
-  schedule_ping();
-}
-
-void NodeWorkload::send(io::ConnId conn, const wire::FrameHeader& header, Slice payload) {
-  Stream& stream = streams_[conn];
-  wire::encode_frame(stream.out, header, payload);
-  flush(conn);
-}
-
-void NodeWorkload::flush(io::ConnId conn) {
-  const auto it = streams_.find(conn);
-  if (it == streams_.end()) return;
-  Stream& stream = it->second;
-
-  while (!stream.out.empty()) {
-    auto written = loop_.network().write(conn, stream.out.slice());
-    if (!written) {
-      if (written.error() == base::ErrorCode::kWouldBlock) {
-        // Backpressure. Park the rest and let readiness say when there is room —
-        // spinning on a full socket is how an event loop starves every other
-        // connection it owns.
-        loop_.network().watch(conn, io::Interest::kReadWrite, this);
+    storage::RecordIterator records(framed);
+    Slice value;
+    base::u64 at = header.value().base_offset;
+    while (records.next(&value)) {
+      if (at >= verifiable) break;
+      if (at >= offset && value != Slice::from_string(payload_for(at))) {
+        oracle_.violation("I1", describe(node_, "committed record holds bytes never written",
+                                         at, 0));
         return;
       }
-      forget(conn);
-      return;
+      ++at;
     }
-    if (written.value() == 0) return;
-    stream.out.consume(written.value());
-  }
-  loop_.network().watch(conn, io::Interest::kRead, this);
-}
-
-void NodeWorkload::on_writable(io::ConnId conn) { flush(conn); }
-
-void NodeWorkload::on_readable(io::ConnId conn) {
-  if (conn == listener_) {
-    while (true) {
-      auto accepted = loop_.network().accept(listener_);
-      if (!accepted) return;
-      Stream& stream = streams_[accepted.value()];
-      stream.outgoing = false;
-      loop_.network().watch(accepted.value(), io::Interest::kRead, this);
-    }
-  }
-
-  // The stream is looked up fresh on every pass rather than held across the loop.
-  // serve() replies, a reply can fail to write, and a failed write calls forget(), which
-  // erases this connection from streams_ — so any reference taken before that point is
-  // dangling by the time the loop comes back around. Cheap lookup, and the alternative
-  // is a use-after-free that only fires when a peer dies mid-request.
-  while (true) {
-    auto it = streams_.find(conn);
-    if (it == streams_.end()) return;
-    Stream& stream = it->second;
-
-    base::MutSlice into = stream.in.append_uninitialized(4096);
-    auto got = loop_.network().read(conn, into);
-    if (!got) {
-      stream.in.shrink_by(4096);
-      if (got.error() == base::ErrorCode::kWouldBlock) return;
-      forget(conn);
-      return;
-    }
-    stream.in.shrink_by(4096 - got.value());
-    if (got.value() == 0) {  // clean EOF
-      forget(conn);
-      return;
-    }
-
-    while (true) {
-      auto live = streams_.find(conn);
-      if (live == streams_.end()) return;
-      Stream& current = live->second;
-
-      wire::FrameHeader header;
-      Slice payload;
-      auto ready = current.decoder.next(current.in, &header, &payload);
-      if (!ready) {  // protocol violation — the stream is not what we think it is
-        oracle_.violation("FRAMING", describe(node_, "undecodable frame from a peer",
-                                              conn, 0));
-        return;
-      }
-      if (!ready.value()) break;
-
-      if (header.api_version == kPing) {
-        serve(conn, header, payload);
-      } else {
-        receive_pong(conn, header);
-      }
-      if (!oracle_.ok()) return;
-
-      // The payload view pointed into the read buffer and is dead now. Re-find, because
-      // serve() may have taken the connection down while replying.
-      auto after = streams_.find(conn);
-      if (after == streams_.end()) return;
-      after->second.decoder.consume_frame(after->second.in);
-    }
-  }
-}
-
-void NodeWorkload::serve(io::ConnId conn, const wire::FrameHeader& header, Slice payload) {
-  if (payload.size() != kPayloadBytes) {
-    oracle_.violation("FRAMING", describe(node_, "ping payload is the wrong size",
-                                          payload.size(), kPayloadBytes));
-    return;
-  }
-  base::u8 reply[kPayloadBytes];
-  base::store_u64_le(reply, log_ != nullptr ? log_->next_offset() : 0);
-  send(conn, wire::FrameHeader{wire::ApiKey::kEcho, kPong, header.correlation_id},
-       Slice(reply, kPayloadBytes));
-}
-
-void NodeWorkload::receive_pong(io::ConnId conn, const wire::FrameHeader& header) {
-  Stream& stream = streams_[conn];
-  // A reply nobody asked for means the byte stream is not the one we wrote into it —
-  // reordered, duplicated, or crossed with another connection. None of those are things
-  // TCP does, so if this ever fires the bug is in the simulated network, not above it.
-  if (stream.awaiting.erase(header.correlation_id) == 0) {
-    oracle_.violation("FRAMING", describe(node_, "pong for a correlation id never sent",
-                                          conn, header.correlation_id));
-    return;
-  }
-  scheduler_.record(EventTag{EventKind::kPong, node_, conn, header.correlation_id});
-  ++pongs_;
-}
-
-void NodeWorkload::on_hangup(io::ConnId conn) { forget(conn); }
-
-void NodeWorkload::forget(io::ConnId conn) {
-  loop_.network().watch(conn, io::Interest::kNone, nullptr);
-  loop_.network().close(conn);
-  streams_.erase(conn);
-  for (io::ConnId& held : peer_conns_) {
-    if (held == conn) held = io::kInvalidConn;  // reconnect on the next ping tick
+    if (at <= offset) break;  // no forward progress; stop rather than spin
+    offset = at;
   }
 }
 

@@ -48,8 +48,26 @@ enum class EventKind : base::u32 {
   kDropped = 35,      // a: conn, b: bytes discarded
   kPartitionStart = 36,  // a: from node, b: to node
   kPartitionEnd = 37,    // a: from node, b: to node
-  kPing = 38,         // a: peer, b: correlation id
-  kPong = 39,         // a: peer, b: correlation id
+  // 38 and 39 were kPing/kPong, which week 4 deleted along with the placeholder workload
+  // they belonged to. The numbers are not reused: an old trace file that still mentions
+  // them should read as "an event this build does not know", not as a Raft campaign.
+
+  // Raft. Deliberately only the *transitions* — a heartbeat every 50 ms across every
+  // link would add hundreds of thousands of events an hour and tell the canary nothing
+  // that kSend and kDeliver do not already say. What is here is what is rare and
+  // meaningful: who campaigned, who voted for whom, who won, and every write of the
+  // one file that must survive a crash.
+  kCampaign = 40,     // a: new term
+  kVote = 41,         // a: term, b: candidate voted for (kNoNode if refused)
+  kLeader = 42,       // a: term
+  kStepDown = 43,     // a: new term, b: leader hint
+  kRaftPersist = 44,  // a: term, b: voted_for
+  kRaftRecover = 45,  // a: term, b: voted_for
+
+  // Replication (week 5).
+  kReplicate = 46,    // a: log end after writing a leader's entry
+  kTruncate = 47,     // a: offset the divergent tail was cut at
+  kCommit = 48,       // a: offset that became committed
 };
 
 const char* to_string(EventKind kind) noexcept;

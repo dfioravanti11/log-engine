@@ -64,8 +64,28 @@ struct SimulationResult {
   base::u64 appends = 0;
   // Per node, so a test can ask whether the cluster shared the work. A node that is
   // silently running slower than its peers is invisible in any total.
-  std::vector<base::u64> batches_per_node;
-  base::u64 pongs = 0;
+  //
+  // Raft ticks rather than appends: every node ticks on the same fixed interval, whereas
+  // since week 5 only the leader appends, so append counts measure who won elections
+  // rather than who is being scheduled.
+  std::vector<base::u64> ticks_per_node;
+  // Raft (week 4).
+  base::u64 raft_messages = 0;
+  base::u64 hard_state_writes = 0;
+  // Terms that produced a leader. Compared against `highest_term`, this is the cheapest
+  // health signal the simulator has: elections far below terms means the cluster is
+  // burning terms without electing anybody.
+  base::u64 elections = 0;
+  base::u64 highest_term = 0;
+  base::u32 leaders_at_end = 0;
+  // The longest stretch with no leader anywhere (I8). Under no faults this should be a
+  // single election timeout — the one at startup. Anything larger is the cluster failing
+  // to recover, which no safety invariant can see.
+  base::Nanos longest_leaderless = 0;
+  // One sample per failover — the time from losing a leader to having one again. NFR-3
+  // asks for p50/p99 across ≥50 induced failures, and this is where they come from.
+  std::vector<base::Nanos> leaderless_gaps;
+
   base::u64 crashes = 0;
   base::u64 partitions = 0;
   base::u64 bytes_lost_to_crashes = 0;
@@ -133,7 +153,9 @@ class Simulation {
 
   base::u64 crashes_ = 0;
   base::u64 partitions_ = 0;
-  base::u64 pongs_ = 0;  // harvested from each workload before its crash destroys it
+  // Harvested from each workload before its crash destroys it.
+  base::u64 raft_messages_ = 0;
+  base::u64 hard_state_writes_ = 0;
 };
 
 SimulationResult run_simulation(const SimulationConfig& config);

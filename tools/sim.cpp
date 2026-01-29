@@ -24,6 +24,12 @@ void usage() {
                "  --duration-s N     simulated seconds per run (default 60)\n"
                "  --dump-trace PATH  write the full event trace of a single seed\n"
                "  --io-errors P      per-operation disk I/O error probability\n"
+               "  --crash-s N        mean seconds between crashes, per node\n"
+               "  --restart-ms N     longest restart delay; short delays bring a node\n"
+               "                     back inside the term it voted in\n"
+               "  --partition-s N    hold each partition this long\n"
+               "  --unsafe-metadata  skip the raft.state fsync. A fault, not a feature\n"
+               "                     (§13) — this is the knob that breaks I6 on demand\n"
                "  --no-faults        no crashes, partitions, or clock jumps\n"
                "  --quiet            one line per seed\n");
 }
@@ -56,9 +62,19 @@ void print_result(const sim::SimulationResult& result, bool quiet) {
               static_cast<unsigned long long>(result.connections_reset));
   std::printf("unflushed bytes lost %llu (the fault kill -9 cannot produce)\n",
               static_cast<unsigned long long>(result.bytes_lost_to_crashes));
-  std::printf("network             %llu bytes delivered, %llu pongs matched\n",
+  std::printf("network             %llu bytes delivered, %llu raft messages\n",
               static_cast<unsigned long long>(result.bytes_delivered),
-              static_cast<unsigned long long>(result.pongs));
+              static_cast<unsigned long long>(result.raft_messages));
+  // Elections against terms is the health line. Every term that elected nobody was a
+  // split vote or an unreachable candidate, and a run where those dominate is a cluster
+  // that is technically correct and practically unavailable.
+  std::printf("raft                %llu elections over %llu terms, %llu state fsyncs\n",
+              static_cast<unsigned long long>(result.elections),
+              static_cast<unsigned long long>(result.highest_term),
+              static_cast<unsigned long long>(result.hard_state_writes));
+  // I8. No safety invariant can see this number, and journal #2 is the reason it is here.
+  std::printf("longest leaderless  %.3f s (no invariant can see this — retrospective #2)\n",
+              base::to_seconds_f(result.longest_leaderless));
 }
 
 int report_violation(const sim::SimulationResult& result) {
@@ -117,6 +133,22 @@ int main(int argc, char** argv) {
       trace_path = argv[++i];
     } else if (arg == "--io-errors" && has_value) {
       config.faults.disk.io_error_probability = std::strtod(argv[++i], nullptr);
+    } else if (arg == "--unsafe-metadata") {
+      config.workload.fsync_hard_state = false;
+    } else if (arg == "--acks-1") {
+      config.workload.ack_on_local_append = true;
+    } else if (arg == "--crash-s" && has_value) {
+      config.faults.crash_interval = base::seconds(std::strtoll(argv[++i], nullptr, 0));
+    } else if (arg == "--restart-ms" && has_value) {
+      const base::i64 ms = std::strtoll(argv[++i], nullptr, 0);
+      config.faults.restart_delay_max = base::millis(ms);
+      if (config.faults.restart_delay_min > config.faults.restart_delay_max) {
+        config.faults.restart_delay_min = config.faults.restart_delay_max;
+      }
+    } else if (arg == "--partition-s" && has_value) {
+      const base::i64 s = std::strtoll(argv[++i], nullptr, 0);
+      config.faults.partition_duration_min = base::seconds(s);
+      config.faults.partition_duration_max = base::seconds(s);
     } else if (arg == "--no-faults") {
       config.faults.crash_interval = 0;
       config.faults.partition_interval = 0;

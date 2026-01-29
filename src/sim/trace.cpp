@@ -42,8 +42,15 @@ const char* to_string(EventKind kind) noexcept {
     case EventKind::kDropped: return "DROPPED";
     case EventKind::kPartitionStart: return "PARTITION_START";
     case EventKind::kPartitionEnd: return "PARTITION_END";
-    case EventKind::kPing: return "PING";
-    case EventKind::kPong: return "PONG";
+    case EventKind::kCampaign: return "CAMPAIGN";
+    case EventKind::kVote: return "VOTE";
+    case EventKind::kLeader: return "LEADER";
+    case EventKind::kStepDown: return "STEP_DOWN";
+    case EventKind::kRaftPersist: return "RAFT_PERSIST";
+    case EventKind::kRaftRecover: return "RAFT_RECOVER";
+    case EventKind::kReplicate: return "REPLICATE";
+    case EventKind::kTruncate: return "TRUNCATE";
+    case EventKind::kCommit: return "COMMIT";
   }
   return "UNKNOWN";
 }
