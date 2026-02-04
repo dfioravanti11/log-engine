@@ -133,6 +133,11 @@ jobs:
             args: --seeds 50 --duration-s 30
           - mode: hostile disk
             args: --seeds 50 --duration-s 30 --io-errors 0.02
+          # Elections need longer runs than storage did: an election timeout is 150-300 ms
+          # and the interesting states are the ones a crash walks into mid-term, so a 30 s
+          # run barely gets past the first leader.
+          - mode: elections
+            args: --seeds 50 --duration-s 120 --crash-s 3 --restart-ms 120
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y ninja-build cmake

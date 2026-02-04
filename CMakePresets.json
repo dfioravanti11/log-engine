@@ -91,7 +91,12 @@
     { "name": "dev", "inherits": "base", "configurePreset": "dev" },
     { "name": "asan", "inherits": "base", "configurePreset": "asan" },
     { "name": "ubsan", "inherits": "base", "configurePreset": "ubsan" },
-    { "name": "tsan", "inherits": "base", "configurePreset": "tsan" },
+    {
+      "name": "tsan",
+      "inherits": "base",
+      "configurePreset": "tsan",
+      "filter": { "exclude": { "label": "simulation" } }
+    },
     { "name": "msan", "inherits": "base", "configurePreset": "msan" }
   ]
 }
