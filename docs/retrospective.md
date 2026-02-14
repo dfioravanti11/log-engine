@@ -109,7 +109,144 @@ Also the cleanest example so far of why the simulator is the deliverable rather 
 log: this is a storage bug, found with no Raft, no cluster, and no network — by a machine
 whose entire job is to be an unreasonable disk, reproducibly.
 
-<!-- Copy the template below for entry #2. -->
+### #2 — One cut link made leadership ping-pong for as long as the partition lasted · Week 4
+
+```
+seed:       3  (./sim --seed 3 --duration-s 40 --crash-s 0 --partition-s 30)
+invariant:  none — and that is the entry. Every one of I1–I6 held throughout.
+symptom:    28 elections in 40 simulated seconds. Leadership alternated between nodes 1
+            and 2 roughly every 200 ms for the entire 30 s partition, and did not stop
+            until it healed. Across a 30-seed sweep with one 60 s link cut: 4228
+            elections, 6237 terms.
+cause:      node 0 could reach both peers. It was receiving heartbeats from a healthy
+            leader and still granted a vote to the node that could not reach that
+            leader — deposing a leader it was, at that moment, talking to. The deposed
+            node then timed out, campaigned, and deposed the other one back. Textbook
+            Raft has no rule against this; the dissertation added one in §4.2.3.
+fix:        src/raft/node.cpp — a follower that has heard from its leader inside a full
+            election timeout drops a RequestVote without answering *and without adopting
+            its term*. The ordering matters: the check has to run before the term rule,
+            because adopting the term is what destroys the evidence it needs.
+            After: 2 elections on the same seed, 53 across the sweep.
+commit:     81ac1c2
+```
+
+**What I believed:** that the invariant checker was the thing that would catch Raft bugs,
+and that a green sweep across 1000 seeds meant elections worked. I had spent the week
+building I6 into the oracle and writing a test that deliberately breaks the metadata
+fsync to prove I6 could go red. It does go red. It is a good check. It is also completely
+blind to this.
+
+**What was actually happening:** a single cut link between two of three nodes. Not an
+isolated node, not a lost majority — the leader still had a quorum the whole time and
+could have served every request. The third node, which could see everyone, kept handing
+out votes to whichever peer had most recently lost contact with the leader. Both healthy
+nodes spent the entire partition deposing each other, and the cluster committed nothing.
+
+The trace made it obvious the moment I looked at the right thing:
+
+```
+4257111705   1 PARTITION_START    2      0
+4520000000   2 CAMPAIGN           2      0
+4521486861   0 VOTE               2      2     <- node 0 votes, while hearing from leader 1
+4522786316   2 LEADER             2      0
+4553234069   1 STEP_DOWN          2      -
+4710000000   1 CAMPAIGN           3      0
+4710935982   0 VOTE               3      1     <- and again, the other way
+4711984100   1 LEADER             3      0
+```
+
+**How I found it:** not from a failing check — nothing failed. I had just added
+`elections` and `highest_term` to the result line, mostly so the demo would have
+something to print, and ran a sweep across fault configurations to see whether the
+numbers looked sensible. Healthy clusters showed 1 election per run. Partitioned ones
+showed 128. That ratio was the entire signal, and I only had it because a counter happened
+to be printed next to the seed.
+
+**Time lost:** about forty minutes, most of it spent confirming the mechanism rather than
+finding it. The fix is nine lines.
+
+**Why a reader cares:** this is the one in the set that is *not* a safety bug, and it is
+the one I would talk about first. The whole apparatus — six invariants, a shadow oracle,
+a deterministic scheduler, a thousand seeds — is built to answer "did the cluster do
+something wrong". It has nothing to say about "did the cluster do anything at all". A
+system can satisfy every safety property ever written down by simply never making
+progress, and mine did exactly that for thirty seconds at a time while reporting green.
+
+The counter that caught it is not a check and still is not one. What week 5 owes this
+entry is a liveness invariant with teeth: over a window in which some majority was
+continuously connected, a leader must exist for most of it. That is harder to state than
+I1–I6 and it is the one that would have caught this on seed 1.
+
+Two more notes worth keeping. It is **not** `[sim-only]` — `tc netem` on three real hosts
+would reproduce it, and I expect it is sitting in a fair number of student Raft
+implementations right now. And the fix is incomplete on purpose: the node behind the cut
+still campaigns into the void, so its term climbs (81 terms in that 40 s run, against 1
+election) and it disrupts the healthy leader once when the partition heals. That half is
+Pre-Vote, and it is deferred to week 5 — see §3.
+
+### #3 — A follower answered "I have all of that" when it had agreed to one line · Week 5
+
+```
+seed:       11  (./sim --seed 11 --duration-s 3600)
+invariant:  I1 — an acked write is never lost, in its replicated form: a leader is
+            guaranteed to hold every committed entry (Raft §5.4.1)
+symptom:    node 0 won an election with a log ending at 67,238 while the cluster had
+            committed through 67,392. 154 committed records held by a leader that did
+            not have them.
+cause:      a follower accepting an AppendEntries replied with its own *log length*
+            instead of the extent it had actually agreed to. Those are different numbers
+            whenever a follower holds a divergent tail from a term that lost — it is
+            longer than the leader, and a heartbeat agreeing about the entry at `prev`
+            says nothing whatsoever about the entries after it. The leader recorded
+            `match` past its own log end, counted entries it had never seen toward the
+            quorum, and committed on the strength of them.
+fix:        src/raft/node.cpp — the response reports what matched (`entry_end` when an
+            entry was accepted, `prev + 1` for a bare heartbeat), and the leader clamps
+            any `match` to its own log end besides. Two independent bounds, because this
+            is arithmetic that decides durability.
+commit:     81ac1c2
+```
+
+**What I believed:** that "how much of your log do you have?" and "how much of my log do
+you have?" were the same question asked from two directions. For most of a run they give
+the same answer, which is exactly why it survived every unit test I had written — in the
+pure tests a follower is never *ahead* of its leader, because the harness only ever builds
+logs by replicating from one.
+
+**What was actually happening:** a follower that had been leader in an earlier term, been
+deposed, and kept its uncommitted tail. It is longer than the new leader. The new leader
+heartbeats about an index they agree on; the follower says "my log is 300 long"; the
+leader writes down `match = 300` for a log that is 250 long, and two nodes reporting 300
+is a quorum for entries 250–299 that exist nowhere.
+
+**How I found it:** the checker I had added an hour earlier, on the run that was supposed
+to be a speed test. `SimulatesAnHourFastEnoughToBeWorthRunning` runs a full simulated hour
+under faults, and the leader-completeness check fired 12.8 seconds in. It reported both
+numbers — the leader's log end and the committed end — and 67,238 against 67,392 named the
+bug almost by itself: the leader was *behind*, so somebody had told it something false
+about how far ahead everyone was.
+
+**Time lost:** about fifteen minutes, nearly all of it deciding whether the checker or the
+code was wrong. That is the standard doubt with a new invariant and it is worth budgeting
+for: a check written today that fires today is more likely to be miscalibrated than right,
+except this time it wasn't.
+
+**Why a reader cares:** the invariant that caught it did not exist in week 4, and it is
+the one I added because journal #2 had just finished teaching me that the existing set was
+blind to whole categories of failure. I1–I6 as written are about *data*; this one is about
+the *argument* — Raft's election safety proof says a leader holds every committed entry,
+so checking it directly turns a paper theorem into a runtime assertion. It found a real
+bug on the first hour it ran.
+
+It is also a good example of a bug that unit tests structurally cannot find. Every pure
+test builds follower logs by replicating from a leader, so no follower is ever longer than
+its leader, so the two quantities are never different, so the confusion is invisible. The
+state that exposes it — a deposed leader with an uncommitted tail rejoining under a new
+one — takes a crash, an election, and a partition to construct. The simulator constructs
+thousands of them an hour and did not have to be asked.
+
+<!-- Copy the template below for entry #4. -->
 
 
 > **Week 2 note on what does *not* go here.** Week 2 found a real correctness bug — the
@@ -182,6 +319,38 @@ a decision with no rejected alternative is not a decision, it's a default.
   and each restart draws, plus a rotating order in which nodes are drained. Randomizing
   the queue on top of that explores nothing new and makes every failing trace harder to
   reason about, because the order of two events stops corresponding to anything real.
+- **`raft::Node` holds no `io::` interface except `Random`.** Week 4. ER-1 only asks that
+  the OS be reached through an injected seam; this goes further and gives the state
+  machine no seam to reach through at all — no clock, no disk, no network. It counts
+  ticks and returns a `Ready` describing what it wants done. Alternative considered: pass
+  it `io::Disk` and `io::Network` and let it persist and send for itself, which is what
+  the Raft paper's pseudocode reads like. Lost on three counts, and the first is the one
+  that keeps paying: a full three-node election is now three objects and a message queue,
+  so `tests/unit/test_raft_election.cpp` runs 19 election tests in **1 ms** with no event
+  loop, no disk, and no time. When the simulator later reported a failure, the algorithm
+  was already ruled out. Second, §13's persist-before-you-respond rule becomes structural
+  — the node *cannot* send, so there is exactly one function in the repo where the
+  ordering could be wrong. Third, timeouts counted in ticks mean the clock-jump fault has
+  no route into Raft at all (§17), which is now a test rather than a claim.
+- **Two alternating slots in `raft.state`, not write-and-rename.** Week 4. The file is
+  rewritten on every term change and every vote, so a torn write there is routine, not
+  exotic — and a node that cannot read its own vote is the amnesiac that elects two
+  leaders. Alternative: write a temp file, fsync, rename. Standard and correct on a real
+  filesystem, but it leans on rename atomicity and directory-fsync semantics, which the
+  simulated disk would then have to model faithfully or the test would be testing the
+  model. Two 32-byte slots with a sequence number need nothing but `pwrite` and `fsync`,
+  both of which are already modelled honestly. A torn write damages only the half being
+  written; load takes the newest half that still passes its CRC.
+- **Pre-Vote deferred to week 5, with the number written down.** Week 4, and it is a
+  deferral rather than a rejection. The §4.2.3 lease rule (bug journal #2) stopped the
+  livelock — 28 elections down to 2 on the seed that showed it — but a node behind a cut
+  link still campaigns into the void, so its term climbs (81 terms against 1 election in a
+  40 s run) and it disrupts the healthy leader once when the partition heals. Pre-Vote
+  fixes that half by not incrementing the term until the candidate knows it could win.
+  Deferred because the livelock was the availability bug and the inflation costs a single
+  election on heal, and because week 5's critical path is replication. **The point of
+  writing it here is that "we knew and chose" and "we didn't notice" look identical in a
+  codebase six months later.**
 - **`log-dump` is read-only, even though the recovery code was right there.** Week 2.
   Alternative: open the segment through `storage::Segment` and print what it holds — ten
   lines instead of a hundred. Lost because `Segment::open()` repairs as a side effect of
@@ -208,8 +377,15 @@ Fill in as measured. Every number carries its conditions or it's noise.
 | p99.9 append latency | — | and the *reason* it's worse than p99 | wk 8 |
 | Failover p50 / p99 | — | ≥ 50 induced failures | wk 8 |
 | Ratio vs Kafka | — | identical hardware — and the explanation of the gap | wk 8 |
-| Simulated node-hours | 12.5 | 500 seeds × 30 s × 3 nodes, one thread, laptop | wk 3 |
-| Distinct bugs found by the simulator | 1 | entry #1, replays from seed 1 | wk 3 |
+| Simulated node-hours | 50.0 | 1000 seeds × 60 s × 3 nodes, one thread, laptop, **9 s wall clock** | wk 4 |
+| Distinct bugs found by the simulator | 3 | entries #1, #2 and #3 — replay from seeds 1, 3 and 11 | wk 5 |
+| acks=quorum+fsync vs acks=1 | **1,882 kept vs 18 lost** | seed 2, 60 simulated s, a crash every 4 s. Same seed, one knob (§13.2) | wk 5 |
+| Longest leaderless stretch (I8) | 0.182 s healthy · 2.156 s under crashes | 3 nodes, 120 simulated s; crashes every 8 s in the second. No safety invariant can see this number | wk 5 |
+| Replication under fault injection | 1.16 M records committed | 500 seeds x 60 s x 3 nodes, 3,591 crashes survived, zero violations | wk 5 |
+| Election churn through one cut link | **28 → 2** | seed 3, 40 s, one 30 s symmetric link cut. Sweep of 30 seeds with a 60 s cut: 4228 → 53 | wk 4 |
+| Term inflation still unfixed | 81 terms / 1 election | same seed and cut. The node behind the cut campaigns into the void; Pre-Vote is the fix, deferred (§2) | wk 4 |
+| Raft election unit tests | 19 tests in **1 ms** | no event loop, no disk, no network — the payoff of a pure state machine (§2) | wk 4 |
+| `raft.state` write | 32 B + fsync | one slot of two, per term change or vote. Not batched, not tunable (§13) | wk 4 |
 | Simulation speed | **3 node-hours in ~2 s** | 1 simulated hour of 3 nodes, ~1.08 M trace events, Apple M1, single-threaded, idle machine. NFR-4 asks for 1 cluster-hour per 5 s | wk 3 |
 | Optimization delta | — | before/after with a flamegraph behind it | wk 7 |
 | fsync-bound append rate | ~100–200 batches/s | Apple M1 laptop, APFS, `F_FULLFSYNC`, fsync **per batch**, 4×64 B records. A durability-latency measurement, not throughput. **Never goes in the README** | wk 2 |
@@ -217,6 +393,10 @@ Fill in as measured. Every number carries its conditions or it's noise.
 | Seed sweep throughput | 500 seeds in ~0.6 s | 30 simulated seconds each, 3 nodes, no I/O errors | wk 3 |
 | Records acked under fault injection | 1,700,730 | 500 seeds, 1,645 crashes survived, zero I1 violations. Was 1,324,798 before the clock-frame fix (§5) — the instrument had been under-reporting its own coverage by 28% | wk 3 |
 | Produce→consume vs append-ack gap | — | the replication-latency delta | wk 8 |
+| Failover time (NFR-3) | **p50 178 ms · p99 489 ms · p99.9 657 ms** | 200 induced leader failures over 10 seeds, 3 nodes, crash every 5 s. Simulated, so virtual time: election + campaign + vote round trip, excluding process restart. Bound is 900 ms (3× election timeout) — **PASS** | wk 8 |
+| Saturation, local | ~1,228 records/s ≈ 1.2 MB/s | `BENCH_LOCAL` — 3 brokers on one M1 laptop, APFS, `F_FULLFSYNC`, 1 KB records, 16/batch, acks=quorum+fsync. **Never goes in the README** | wk 8 |
+| Append-ack latency, local | p50 8.5 ms · p99 12.6 ms @ 1,000 rec/s | same run, ~81% of saturation. p50 ≈ **one F_FULLFSYNC** — the number that exposed the missing group commit | wk 8 |
+| Latency above the knee | p50 1,474 ms @ 2,000 rec/s offered | same run. The queue *is* the latency past saturation, which is what open-loop measurement is for — a closed-loop producer would have reported none of this | wk 8 |
 
 ## 5. Things that surprised me
 
@@ -451,6 +631,262 @@ size**, not log size — which turns "how big should a segment be?" from a throu
 question into a recovery-latency question. That is the real argument for 32 MB over
 Kafka's 128 MB default, and it is a better answer than the one in `project_spec.md` §25.
 
+### Week 8 · The benchmark found a feature that was never built
+
+§13.1 is one of the decisions I was proudest of in week 0. The question is how to get
+throughput out of a system that must fsync before acking, and the answer written down is:
+**delay the response, not the write** — append to the page cache immediately, respond after
+the next group fsync, amortize one device flush across many in-flight appends. The spec
+even says why the alternative is dishonest.
+
+It is not implemented. `Broker::propose()` calls `log_->fsync()` per batch, one flush per
+entry, and it has done since the day the driver was written. I read that line dozens of
+times across three weeks without registering that it was the thing §13.1 exists to avoid.
+
+What made it visible was a number. p50 append-ack latency came out at **8.5 ms**, and 8.5 ms
+is not a number a program produces — it is a number a *device* produces. It is one
+`F_FULLFSYNC` on APFS, sitting under every single append, exactly as the spec predicted it
+would if you did the naive thing.
+
+The saturation sweep says the rest: throughput flattens at ~1,228 records/s, which is the
+fsync rate times the batch size and nothing to do with CPU, network, or the log format.
+Every line of careful work on batch encoding and zero-allocation buffers is invisible
+behind one synchronous flush per entry.
+
+Three things worth keeping from this.
+
+**A design document is not an implementation, and the gap is invisible from the inside.**
+The spec said group commit, the code said fsync-per-batch, both were in front of me the
+whole time, and no test could tell the difference — group commit is a *throughput*
+decision, and every correctness test I have would pass identically either way. It took a
+measurement to see it, which is the entire argument for §19 existing at all.
+
+**It is the ideal candidate for §19 #5** ("one before/after optimization with a percentage
+and a flamegraph behind it"). I now have the before number, measured, with conditions
+attached, and a specced design to implement against. That is a much better story than
+optimizing something I picked because it looked slow.
+
+**The overload behaviour is its own finding.** Past saturation the cluster does not just
+get slower: at 4× the knee it starts burning Raft terms, because the event loop is so busy
+fsyncing that it starves its own tick timer and followers time out. A broker that
+fails an election because it is *working too hard* is a nice illustration of why §15's
+thread-per-core split matters, and it argues for taking the fsync off the loop that owns
+consensus timing.
+
+### Week 6 · The bet paid, and the payment was a diff
+
+Three weeks of this project rested on one claim: everything above the `io/` seam runs
+identically in production and in the simulator. Week 6 is where that either holds or is
+revealed as a story I had been telling myself.
+
+The honest test is not "does the real binary work". It is **which object does the
+simulator test?** Weeks 3–5 grew the driver — the persist-then-send code, the part §13 is
+about — inside `sim/workload.cpp`. If `server/` had been written fresh alongside it, every
+correctness claim in the README would have been about a *sibling* of the shipped code, and
+the sentence "1000 seeds, 2.3 M records, 7,205 crashes" would have been quietly false in a
+way no test could detect.
+
+So the work was a move, not a write: about 300 lines went from `sim/` to `server::Broker`,
+and `sim::NodeWorkload` went from *being* the driver to *owning* one. The simulator watches
+through an observer interface where every hook is an observation and none is a decision —
+a null observer changes nothing about what a broker does, which is what makes the claim
+checkable rather than rhetorical.
+
+**The measurement that mattered:** the 1000-seed sweep produced byte-identical totals
+before and after the move — 2,320,262 records, 7,205 crashes, same numbers. That is the
+whole proof. Then the same object, with `io/real/` constructed instead of `io/sim/`, ran
+three processes over loopback and survived a `kill -9` on the leader.
+
+Two things I did not expect.
+
+**The first real-hardware run worked.** Not "worked after a day of debugging" — the first
+three-process cluster elected a leader and committed 1,216 records. After three weeks of
+being told by a simulator that this code was correct, that should not be surprising, and it
+was anyway, because the usual experience of moving code to real I/O is a week of
+socket-level surprises. There were none, and the reason is that the socket-level surprises
+had all been simulated already: partial writes, backpressure, connections dying mid-request.
+
+**The extraction introduced exactly one bug, and the checker caught it.** The I2 check
+sampled the oracle's commit index *after* calling propose — which is fine when the ack
+happens later, and wrong under `acks=1`, where the append commits itself before returning.
+Every single append then looked like an offset regression. Caught on the first run, named
+precisely, on a seed. A refactor of the most safety-critical code in the project cost about
+ninety seconds of debugging, and that — rather than any individual bug — is what the
+simulator bought.
+
+### Week 5 · The test that caught me sabotaging the tests
+
+Replication made a simulated second several times more expensive, and the two simulation
+binaries went from seconds to **29 and 36 minutes** under UBSan. So I shortened the runs
+for instrumented builds — the same trick that worked in week 4 for seed counts.
+
+`Simulator.FaultsActuallyFire` immediately went red with four zeroes: no crashes, no
+partitions, no resets, no unflushed bytes lost. I had shortened the runs to six simulated
+seconds and the default crash interval is twenty. Every one of those runs had been a
+completely fault-free run wearing the label of a fault test.
+
+That test exists for exactly one reason — week 1's lesson that a check which cannot fail is
+worse than no check — and it caught the person who wrote it, doing the thing it was written
+to prevent, from a direction I did not anticipate. **Not by changing the check, but by
+changing something else entirely and letting the check go quiet.** The other simulation
+tests would have kept passing indefinitely, on runs where nothing ever went wrong.
+
+The fix is a small design principle worth keeping: a test about faults should *configure*
+faults that fire promptly, not inherit a global duration and hope it is long enough. It
+now sets a two-second crash interval and does not care how long the run is. The one
+exception is unflushed-write loss, which genuinely needs runway — the window between a
+write and its fsync got narrow in week 5, because now everything is fsynced — so that one
+keeps its full twenty seconds in every build, with a comment saying why.
+
+Final numbers: 40 minutes to 82 seconds across all four presets, with every code path still
+covered. The seed breadth is what got cut, and seed breadth is a logic argument that a
+deterministic simulation makes build-independent.
+
+### Week 5 · The invariant that had to be conditional to be true
+
+I8 took three attempts to state, and the failures are more interesting than the result.
+
+*"A leader always exists"* — false, and obviously so: every election has a moment with no
+leader, and that moment is the algorithm working.
+
+*"A leader exists at least 95% of the time"* — false in a way that took longer to see. A
+cluster partitioned so that no majority can communicate is **supposed** to have no leader,
+indefinitely, and a checker that flags that is demanding the system violate Raft. Any
+threshold I picked was really a statement about my fault injector's settings, not about
+the system.
+
+What is actually true is conditional: *once a majority can communicate again, a leader
+appears within a bounded time*. And that is awkward to check, because "a majority can
+communicate" is a fact about the fault injector, not about the cluster — so the invariant
+needs to reach into the adversary to evaluate itself.
+
+The shape I settled on: the simulator measures the longest leaderless stretch and reports
+it; the *test* supplies the bound, because the test is the thing that knows what faults it
+injected. A healthy cluster gets 1 second and uses 0.182. A cluster being crashed every 8
+seconds gets 15 and uses 2.156.
+
+That is weaker than a real liveness proof and I want to be honest about it in the post:
+it is a smoke alarm, not a theorem. But it is the difference between noticing bug journal
+#2 in ten minutes and not noticing it for a week, and the general lesson is one I had not
+appreciated before writing it — **safety invariants are absolute and liveness invariants
+are always relative to an assumption about the environment.** That is why every paper
+states liveness "under a synchrony assumption" and why I had never had to think about it
+until I tried to write the check down.
+
+### Week 5 · Two number lines that looked like one
+
+The cost of §12's central decision, and the bug I would most expect a reader to have
+already made themselves.
+
+Raft's log is a sequence of **entries**. Kafka's log is a sequence of **records** with
+offsets. This project's whole premise is that they are the same log — so an index and an
+offset are the same number, right up until a batch holds more than one record. A batch of
+two at offset 12 means the next entry starts at 14, not 13.
+
+I wrote `log_end_ = index + 1`. Every subsequent index then pointed into the middle of a
+batch, where no read can start and no append can land, so the leader silently failed to
+send *anything* — not even heartbeats, because a heartbeat to a follower that needs an
+entry is an entry-carrying message. The symptom was **89 elections in 30 simulated
+seconds with no faults injected at all**, which is a spectacular way for an off-by-one to
+present.
+
+Two things worth keeping. First, the fix is not "add one correctly" but "carry the extent
+explicitly" — `entry_end` is on the wire because only the *sender's storage layer* knows
+how many records a batch holds, and the consensus layer must be told. Second, the same
+confusion had a second head: the rejection hint. Classic Raft backs off one index per
+round trip, which here lands mid-batch, so the follower has to answer with a place it
+knows is a boundary. §12.2 says offsets are "monotonic, not dense" and I had written that
+sentence myself in week 0; knowing it and having it in my fingers turned out to be
+different things.
+
+### Week 4 · Six invariants, and not one of them is about the system working
+
+This is bug journal #2 stated as a principle, and it is the thing I most want to say in
+the post. I1–I6 are all *safety* properties: nothing is lost, nothing is reordered,
+nothing is overwritten, no two leaders in a term. Every one of them is satisfied, trivially
+and permanently, by a cluster that does nothing at all.
+
+So a thousand seeds ran green while a single cut link had two healthy nodes deposing each
+other every 200 ms, committing nothing, for as long as the partition lasted. The trace hash
+was stable. The oracle was happy. The system was safe, available on paper — there was
+always a leader! — and useless.
+
+What caught it was a counter I had added to make the demo output look better. Healthy runs
+showed one election; partitioned runs showed 128. Nobody wrote a check; somebody looked at
+a number that happened to be printed next to the seed.
+
+The general form is worth more than the bug: **a safety-only invariant set cannot
+distinguish a working system from a stopped one**, and the liveness properties that could
+are genuinely harder to state, because every honest version needs a hypothesis about what
+the network was doing. "A leader exists" is false during any legitimate election. The one
+worth building is conditional — over a window in which some majority stayed connected,
+a leader existed for most of it — and it is week 5's debt.
+
+### Week 4 · The bug where every layer behaves exactly as documented
+
+Found by reading, not by the simulator, so it is not in §1 — same category as week 2's CRC
+placement. It is the best example so far of a fault with no faulty component.
+
+`take_ready()` handed the driver the pending hard state and cleared the "needs persisting"
+flag in the same breath. The driver persists, then sends; if the fsync fails it drops the
+whole batch and sends nothing. Read either half on its own and both are correct. Read them
+together:
+
+1. The node grants a vote in term 5. Flag set, response queued.
+2. The driver takes the batch. **Flag cleared** — nothing has been written yet.
+3. The fsync fails. The driver drops the response. Correct so far: nobody was told.
+4. The vote now exists only in memory, and nothing anywhere records that it owes a write.
+5. The candidate retries. The node grants again — correctly; the vote is already committed
+   to that candidate. But `votedFor` is *already* set, so nothing changed, so no flag, so
+   the driver has nothing to persist and sends the grant straight out.
+6. A vote that never reached the platter has now been announced. Crash, and it votes again
+   in term 5.
+
+Nothing misbehaved. The state machine followed Raft, the driver followed §13, and the
+composition violated it. The fix is to make the debt **sticky**: `take_ready()` no longer
+clears anything and the driver calls `hard_state_persisted()` once the fsync returns.
+
+What makes this worth writing down is the asymmetry that picks the design. Both versions
+can be got wrong; they just fail in different directions. Forget to acknowledge, and the
+node rewrites 32 bytes it had already written. Clear it optimistically, and you get the
+above. **When a default has to be picked for a rule that cannot be enforced, pick the one
+whose failure is a wasted write rather than a lost promise** — and it is worth noticing
+that I had written the optimistic version first without pausing, because it reads more
+naturally.
+
+A second, smaller thing fell out of the test I wrote for it: granting a repeat vote to the
+same candidate was marking the state dirty even though nothing had changed, so a candidate
+retrying every election timeout was costing an fsync per retry — a stall on the durability
+path at exactly the moment the cluster is already in trouble. Now only an actual change
+owes a write.
+
+### Week 4 · The state machine that could not be told what time it is
+
+`raft::Node` counts ticks. It has no clock, and the driver's tick timer runs on the
+monotonic clock, so the simulator's wall-clock-jump fault has no path into Raft whatsoever
+— I wrote `ClockJumpsDoNotDisturbElections` expecting to have to fix something and it
+passed on the first run, jumping the wall clock by a minute every five seconds.
+
+That is `project_spec.md` §17's line "correctness never depends on wall clock" turning out
+to be free rather than expensive, and only because of a decision made for a different
+reason. Ticks were chosen for testability — you can drive 400 of them in a loop with no
+time source at all — and immunity to clock skew fell out of it. Worth noting that the
+usual framing has this backwards: clock-independence is normally presented as discipline
+you maintain, when here it is a property of a type that has no way to express a deadline.
+
+### Week 4 · Writing the amnesia test made the fsync argument for me
+
+I wrote `ANodeThatForgetsItsVoteElectsASecondLeaderInTheSameTerm` before the driver
+existed: construct a node, have it grant a vote in term 5, then construct a *second* node
+with a default `HardState` — a restart that lost the file — and offer it a different
+candidate in the same term. It votes. Of course it votes; nothing is wrong with it.
+
+Twelve lines, no infrastructure, and it turns "fsync before responding" from a rule I was
+following because §13 says so into something I could see. The message the amnesiac sends
+is perfectly well-formed. Nothing downstream can detect it. The only place that bug can be
+prevented is the one function that decides whether to wait for the platter — which is why
+the driver has exactly one such function and the state machine cannot send at all.
+
 ## 6. Things that were harder than expected
 
 With the actual reason, not "it was tricky." Time cost included.
@@ -473,6 +909,45 @@ separate times it looked like it worked when it didn't:
 The pattern in all three: **the failure mode of a demo is looking like it passed.** Same
 lesson as week 1's vacuous ER-1 grep, from a completely different direction, which is
 starting to feel like the actual theme of this project rather than a coincidence.
+
+### Week 4 · The sanitizer presets are `-O0`, and I had not priced that in
+
+`test_raft_cluster` runs in 2.2 s under `dev` and I left it at 40 seeds without thinking
+about it. Under UBSan the same binary was still going after four minutes. Not hung —
+the simulation is deterministic, so it was doing exactly the same work — just doing it in
+a build that is `Debug` *and* instrumented. `dev` is `RelWithDebInfo`; `asan`, `ubsan` and
+`tsan` are all `Debug`. That is roughly a hundredfold on a compute-bound simulator, and I
+had been reading week 3's "TSan takes 248 s" as a TSan fact rather than an `-O0` fact.
+
+The fix was to stop conflating two things a sweep does. Breadth over seeds is a **logic**
+argument, and the logic is build-independent because the simulation is deterministic —
+seed 37 under ASan proves nothing seed 37 under `dev` did not. What the sanitizers
+actually need is **coverage of a code path**, and the fortieth seed walks the same lines
+as the first. So instrumented builds now run a handful of seeds and the optimized build
+runs the full sweep, with the one seed the demo depends on pinned and run everywhere
+(`tests/support/build_mode.h`).
+
+Worth noting what that pinning caught immediately. I had written the test's fault config
+by hand rather than copying the demo's command, zeroing partitions and clock jumps "to
+isolate the variable" — and seed 4 stopped violating, because its violation depends on the
+partitions being there. **A seed is only evidence together with its entire configuration**,
+which is obvious stated plainly and was not obvious while typing.
+
+Then TSAN timed out on both simulation tests — 600 s each, a thirty-minute job — and the
+fix turned out to be a rule this project wrote down in week 1 and never implemented. ER-5
+says TSAN runs on the real runtime only, because the simulator is single-threaded by
+construction and there is no data race in it to find. The `tsan` preset's *display name*
+literally reads "real runtime only; useless in sim". Nothing enforced it. So TSAN had been
+grinding through the simulator since week 3, finding nothing, and week 3 had absorbed that
+as a 248-second run and raised a timeout rather than asking why the number was large.
+
+One label and one preset filter later: **1828 s with two timeouts → 7.6 s, 18/18.**
+
+The lesson is not about TSAN. A rule that exists only in prose is a rule that is being
+violated somewhere and nobody knows it — which is precisely the argument for ER-1's grep,
+made by the one engineering rule in this project that had no mechanical check. The
+timeout raise in week 3 is the tell: a limit was hit, the limit got raised, and the
+question of what the work was *for* never came up.
 
 ## 7. Things that were easier than expected
 
@@ -534,6 +1009,20 @@ here once there are enough to choose from, and note which one is the pitch examp
   couldn't express is the one where the bytes are fine and the device misbehaves. Two
   percent read errors, seed 1, seventeen simulated seconds."*
 
+- **#2 — one cut link made leadership ping-pong for the whole partition.** Not
+  `[sim-only]` — `tc netem` reproduces it — but it is the better *story*, and it may end
+  up being the one the post is built around, because it is the only one so far where the
+  entire correctness apparatus was working perfectly and reporting green. The 60-second
+  version: *"a thousand seeds green, six invariants checked after every event, and the
+  cluster was spending thirty seconds at a time electing a new leader every two hundred
+  milliseconds and committing nothing. All six invariants are safety properties. A cluster
+  that does nothing satisfies every one of them. What caught it was a counter I'd added to
+  make the demo output look nicer — healthy runs showed one election, partitioned runs
+  showed a hundred and twenty-eight."*
+
+  The two make a good pair, and the pairing is probably the shape of the post: #1 is what
+  the simulator is *for*, #2 is what it still could not see.
+
 ## 9. Quotes, snippets, and images to reuse
 
 Diagrams, a flamegraph before/after, the leader-kill GIF, a trace diff that localized a
@@ -546,7 +1035,17 @@ file path so week 9 isn't an archaeology expedition.
 
 Draft these from what actually happened, not from the spec. Each one needs an anecdote.
 
-- Walk me through leader election. What happens in a split vote?
+- Walk me through leader election. What happens in a split vote? *(Have the anecdote:
+  `WithoutJitterLockstepNodesSplitTheVoteForever` — set the jitter to zero and three
+  lockstep nodes campaign, self-vote, reject each other, and climb the term forever
+  without ever electing anyone. It is the jitter, not the timeout, that resolves it.)*
+- How do you test consensus? *(The pure state machine: no clock, no disk, no socket. 19
+  election tests in 3 ms. Then the same code under a fault simulator. The point is that
+  "the algorithm is wrong" and "the driver is wrong" became separately answerable.)*
+- Where does the fsync go, and why there? *(§13 — and the twelve-line test that builds an
+  amnesiac node and watches it hand out a second vote in the same term. Then the harder
+  version: the composition bug in §5, where the state machine and the driver were each
+  correct and the pair was not.)*
 - The leader acks a write and crashes before replicating. What did the client see, and was that correct?
 - Your user log *is* the Raft log. What happens to a consumer that read a record on a follower that then truncates?
 - Why thread-per-core? When would a thread pool beat it?

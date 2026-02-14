@@ -19,6 +19,324 @@
 
 ## [Unreleased]
 
+### Week 8 — the benchmark suite · 2026-08-16
+
+`bench/run_all.sh` produces every number in one command, each with its conditions attached.
+**Criterion 7's harness is done**; the throughput numbers stay out of the README until they
+come off real hardware, which is this project's own rule and not a technicality.
+
+**Added**
+- `bench/histogram.h` — exact percentiles by storing and sorting. A few million samples is
+  tens of megabytes and one sort off the hot path; an approximate percentile would be one
+  more thing a reader has to take on trust when the numbers are the whole point.
+- `bench/failover.cpp` — **NFR-3, and it passes**: p50 178 ms, p99 489 ms, p99.9 657 ms over
+  200 induced leader failures, against a 900 ms bound. Measured in the simulator so every
+  failure lands where a seed put it and an outlier replays; the trade (it excludes process
+  restart and scheduler latency) is stated in the output itself.
+- **Open-loop load generation** in the broker binary (`--bench-rate`, `--record-bytes`).
+  Latency is measured from when a record was *due* to be issued, so a stall stays in the
+  histogram instead of vanishing exactly when it matters — coordinated omission, avoided
+  by construction rather than by disclaimer.
+- `bench/run_all.sh` — simulator totals, failover, a saturation *sweep* rather than a single
+  rate (NFR-2 asks for a p99 at 70% of saturation, so saturation has to be measured first),
+  and the `acks` trade-off. Prints hardware, filesystem, mount options and the exact command.
+
+**Found**
+- **§13.1's group commit was specified and never implemented.** Every append costs one
+  synchronous fsync, so throughput is pinned to the device flush rate. Visible only as a
+  number: p50 append-ack latency of 8.5 ms is one `F_FULLFSYNC`, and the sweep flattens at
+  ~1,228 records/s. No correctness test could ever have caught it — group commit is a
+  throughput decision and every invariant passes identically either way.
+  `project_spec.md` §13.1 now records the gap; `retrospective.md` §5 tells the story.
+- **Past saturation the cluster burns Raft terms.** At 4× the knee the event loop is so busy
+  fsyncing that it starves its own tick timer and followers time out. A broker losing an
+  election because it is working too hard is a good argument for §15's thread-per-core split.
+
+**Fixed**
+- The first failover run reported p99 = 2.9 s and failed NFR-3. The bug was the measurement:
+  it counted every leaderless stretch, including those where *two of three nodes were down*
+  and having no leader is correct — so it was reporting `restart_delay_max` wearing a
+  benchmark's clothes. Failover samples now require a majority to have been alive
+  throughout, which is the same conditionality I8 is stated with, applied to a measurement.
+- `run_all.sh` copied `disown` from the week-6 demo, which also makes `wait` return
+  instantly — so every number was read out of a file nothing had been written to yet.
+
+### Week 6 — the architectural bet, settled · 2026-08-16
+
+Demo ran. `scripts/demo_week6.sh`: **three real processes, real TCP, real disks.** A leader
+is elected, the cluster commits, `kill -9` takes the leader out with no shutdown and no
+flush, a new leader is elected in the next term, and the commit index goes 548 → 1,116
+without ever moving backwards. `log-dump` reads both survivors' segments back off disk.
+
+**The extraction is the story.** Weeks 3–5 grew the driver — the code that implements
+§13's persist-then-send — inside `sim/`. Week 6 moved it to `server::Broker` unchanged,
+and `sim::NodeWorkload` now *owns* one instead of being one. That direction matters more
+than it looks: if production had its own copy, the simulator would have been validating a
+sibling of the shipped code rather than the shipped code, and every correctness claim in
+the README would have been about the wrong binary.
+
+The evidence that the move was faithful: the 1000-seed sweep produced **byte-identical
+totals** before and after — 2,320,262 records, 7,205 crashes — and all 21 test binaries
+stayed green.
+
+**Added**
+- `server::Broker` — storage + raft + connections + the tick loop, over injected `io::`
+  interfaces. It holds no simulator types and no production types; which implementation
+  arrives is the caller's business.
+- `server::BrokerObserver` — how `sim/` watches without being linked into production.
+  Every hook is an *observation*, never a decision, so a null observer changes nothing
+  about what a broker does.
+- `src/main/logengine.cpp` — the product. One broker process, `--id/--port/--dir/--peers`,
+  with an optional built-in producer so a three-node cluster does something worth watching
+  before there is a client library.
+- `scripts/demo_week6.sh` — brings up three processes, waits for a leader, SIGKILLs it,
+  and fails loudly if the commit index regresses across the failover.
+
+**Changed**
+- `sim::NodeWorkload` is now the load generator and the invariant checker, and nothing
+  else. Roughly 300 lines of driver left this file for `server/`.
+
+**Fixed**
+- The I2 check sampled the oracle's commit index *after* proposing, which under `acks=1`
+  is after the append has already committed itself — so every append looked like a
+  regression. Caught on the first run after the extraction, by the checker, which is the
+  checker doing its job on a refactor rather than on a bug.
+
+### Week 5 — Raft replication · 2026-08-16
+
+Demo ran. `scripts/demo_week5.sh`: a replicated log committing 2,390 records a simulated
+minute on one term; **1000 seeds green** — 50 simulated node-hours, 2.3 M records
+committed, 7,205 crashes survived, in 13.7 s of wall clock; and the headline, seed 2,
+`acks=quorum+fsync` keeping all 1,882 records where `acks=1` loses 18.
+
+**Acceptance criterion 4 is met**, and the bug journal reached 3 entries — the weeks 4–5
+milestone in full.
+
+Built in two halves, deliberately: the consensus logic first, with the driver untouched
+so the build stayed green throughout, then the wiring.
+
+**Added (raft/)**
+- **The log, as metadata only.** `raft::Node` still holds no entries — it holds the log's
+  exclusive end and an append-only `vector<Epoch>` of which term produced which range.
+  That is the leader epoch cache of §12.3, and it is what lets the node answer Raft's two
+  questions about a log ("how current is yours?", "what term is the entry at N?") while
+  the entries live in `storage::Log` and nowhere else. A hundred entries from one leader
+  is one epoch; ten million entries across four leader changes is five.
+- `Ready` grew the replication instructions: `truncate_from`, `append_entry`,
+  `commit_index`. The division of labour is that **the node owns decisions and the driver
+  owns bytes** — the node names an index to send and the driver reads that batch out of
+  storage; the node says an arriving entry is acceptable and the driver, already holding
+  the decoded bytes, writes it.
+- **One entry per AppendEntries**, because §16.2 already says a batch *is* an entry. No
+  entry arrays, no per-entry length prefixes, and no ambiguity about how many terms a
+  message spans: the batch header carries `base_offset` and `leader_epoch`, so an entry is
+  self-describing on the wire and on disk.
+- Log matching (§5.3) with truncate-on-conflict, `next`/`match` per follower with
+  optimistic initialisation and one-round-trip backoff, and commit advancement under the
+  **§5.4.2 rule** — a majority holding an entry is *not* enough to commit it if it came
+  from an earlier term.
+- `tests/unit/test_raft_replication.cpp` — 16 tests, no storage, no disk, no event loop.
+  A "log" is a `vector<Term>` and a "driver" is thirty lines of harness that carries out a
+  `Ready` in the order `Ready` states it, asserting on every single one that the commit
+  index never moves backwards and never passes the log end.
+
+**Changed**
+- Indices are storage offsets throughout, described by an **exclusive end**: `log_end == 0`
+  is an empty log. The Raft paper starts at index 1 and uses 0 for "empty", which would
+  have meant a translation at every `raft/`↔`storage/` boundary for no benefit.
+  `set_log_state()` became `restore_log(end, epochs)` and `log_appended(index, term)`.
+
+**Then wired end to end.** The simulator now runs a *replicated* log: one leader appends,
+followers receive entries over the real wire codec and write them to the real
+`storage::Log`, and a record is acked when it commits rather than when its writer fsynced
+it. 500 seeds green, 1.16 M records committed, 3,591 crashes survived. With no faults:
+one election, one term, 2,390 records committed in 60 simulated seconds.
+
+**Added (storage)**
+- `Log::append_replicated()` — `append()` with the offset decision *removed* rather than
+  delegated. The batch carries the offset the leader assigned and must land at exactly
+  that offset with exactly those bytes; re-framing would change the CRC and destroy the
+  identity that makes "these two nodes hold the same entry" checkable. `Log` stays the
+  offset authority for everything a client writes (I2); this is the one path where the
+  authority sits upstream.
+- `Log::truncate_to()` / `Segment::truncate_to()` — drops a divergent tail at a named
+  batch boundary. Unlike recovery's truncation, which cuts at the first thing that fails
+  to decode, this one cuts where Raft says to, because the bytes are perfectly valid.
+- `Log::scan_epochs()` / `Segment::scan_headers()` — rebuilds the leader epoch cache
+  (§12.3) by walking batch headers. Derived, never persisted: a second durable structure
+  is a second thing that can disagree with the first.
+- 10 new `LogTest` cases covering all three, including a replicated batch with a corrupted
+  body (checked *before* it is written, not after it is read back).
+
+**Added (wire)**
+- The Raft message grew a 72-byte header plus an optional attached batch, copied verbatim
+  with its CRC. `entry_end` is carried explicitly and is **not** `entry_index + 1` — an
+  index is a record offset and an entry is a batch of several, which §12.2 already implies
+  and which cost an afternoon to rediscover (see below).
+
+**Fixed**
+- **Bug journal #3** — a follower answered an AppendEntries with its own log *length*
+  rather than the extent it had agreed to. Whenever a follower held a longer divergent
+  tail than its leader, the leader recorded `match` past its own log end and committed
+  entries that existed nowhere. Caught by a new I1 check — a leader must hold every
+  committed entry (§5.4.1) — on its first simulated hour, seed 11.
+- **Raft indices are record offsets, not entry numbers.** `log_appended()` advanced the
+  log end by one per batch, so every later index landed mid-batch where no read can start
+  and no append can land. The leader stopped sending anything at all — not even
+  heartbeats — and the cluster spent its whole life electing: **89 elections in 30
+  simulated seconds with no faults injected**.
+- `entry_buf_` was declared and never sized, so every attempt to read a batch for
+  replication failed silently and `send_raft()` returned without sending. Same symptom as
+  above, and found at the same time.
+- A follower's rejection hint must be a **batch boundary**. Classic Raft backs off one
+  index per round trip; here that lands in the middle of a batch. The follower now answers
+  with its own log end, or the first index of the epoch it disagreed in — the
+  conflicting-term optimization, which also skips the whole disputed run in one round trip.
+
+**Then the durability trade-off, made visible.** `scripts/demo_week5.sh` ran.
+
+**Added (the `acks` knob — FR-2, §13.2)**
+- `acks=quorum+fsync` (default): a record is promised once it is committed, i.e. a
+  majority holds it durably. `acks=1`: the leader answers the moment its own fsync
+  returns. **Acceptance criterion 4 is met** — seed 2, thirty crashes: quorum keeps every
+  promise across 1,882 records; `acks=1` loses 18 of them at t=56.9 s, because a leader
+  died before replicating and a new one was elected that had never seen them. Neither
+  setting is a bug; they are different promises, and the simulator holds the system to
+  whichever one it made.
+
+**Added (I8 — liveness)**
+- The invariant journal #2 said was missing, now in `project_spec.md` §6. The simulator
+  measures the longest stretch with **no leader anywhere**, sampled at every instant the
+  clock lands on. Healthy: **0.182 s** — the startup election and nothing else. Under
+  crashes every 8 s: **2.156 s**.
+- Stated conditionally on purpose. The unconditional version is false: during a partition
+  that costs the majority, having no leader is *correct*. So the simulator reports the
+  number and the caller decides what is tolerable given the faults it injected.
+- `tools/sim` prints it on every run, and `--acks-1` selects the fast promise.
+
+**Fixed (CI time)**
+- Replication made a simulated second several times more expensive, and the two simulation
+  binaries hit **29 and 36 minutes** under UBSan. Instrumented builds now scale run
+  *durations* as well as seed counts (`tests/support/build_mode.h`), and the four
+  seed-specific scenarios — which cannot be shortened without becoming different tests —
+  step aside there and run in full in the optimized build. **40 minutes → 82 seconds**
+  across dev/asan/ubsan/tsan, with every code path still covered.
+- `Simulator.FaultsActuallyFire` caught that change making the fault tests vacuous: six
+  second runs against a twenty second crash interval meant *no faults fired at all*. It now
+  configures faults that fire promptly instead of inheriting a duration and hoping.
+  `docs/retrospective.md` §5 — it is the best example yet of why that test exists.
+
+**Still deferred to keep the endgame short:** Pre-Vote, check-quorum, and I3–I5 in the
+oracle. All three are real and none of them blocks an acceptance criterion — see
+`project_status.md` for what that costs and why the call was made.
+
+### README · 2026-08-15
+
+Written to the §20 outline, five weeks before it is due, because four of the seven
+acceptance criteria are "it is in the README" and none of them can be satisfied by code.
+It now accumulates instead of being written in one sitting in week 8.
+
+Everything unbuilt is marked `[planned — week N]` rather than described in the present
+tense, and every number carries its conditions — including the ones that are *not*
+comparable to a production system (loopback echo, fsync-per-batch on a laptop) and say so.
+The three build/test/sweep commands are verified against a clean configure.
+
+### Week 4 — Raft leader election · 2026-08-15
+
+Demo ran. `scripts/demo_week4.sh`: a healthy cluster elects one leader and holds it for
+two simulated minutes on one term; **1000 seeds green** under crashes, partitions and
+clock jumps with I6 checked after every event; and the headline — one seed, one knob, the
+`raft.state` fsync on versus off, clean versus *two leaders in term 18*.
+
+**The simulator found its second bug**, and this one is not a safety bug at all: see
+*Fixed* and `retrospective.md` §1 entry #2.
+
+**Added**
+- `raft/types` — `HardState`, `Message`, `Config`, and `Ready`. `Ready` is where §13
+  lives: if `persist_hard_state` is set, the state must be durable *before* any message
+  in the same batch is sent. Bundling them makes the ordering reviewable in one place.
+- `raft/node` — the election state machine: follower/candidate/leader, randomized
+  timeouts, one vote per term, the §5.4.1 up-to-date check, step-down on a higher term,
+  and heartbeats. **It holds no `io::` interface except `Random`** — no clock, no disk, no
+  socket. It counts ticks and asks; the driver acts. See `retrospective.md` §2.
+- `raft/state_file` — `raft.state` as two alternating 32-byte slots, each CRC'd and
+  sequence-numbered. A torn write can only damage the half being written, so the previous
+  half is still there and still valid. A file whose *both* halves are gone is an error
+  that keeps the node down, not a fresh start — coming back as a term-0 voter is exactly
+  the amnesia the file exists to prevent.
+- `raft/codec` — fixed 48-byte message payloads under api keys 100/101, versioned at v0.
+  Week 5 grows a variable tail for log entries, which is what the version is for.
+- `sim/workload` is now the **driver**: it loads `raft.state`, ticks the node, and carries
+  out `Ready` in one function, `drive()`, which persists and then sends. There is no
+  second code path that sends a Raft message.
+- `Oracle::record_leader()` — **I6**, held by the simulator rather than derived by asking
+  nodes who the leader is. A node that wins a term and is destroyed by a crash before
+  anyone observes it still won.
+- `tools/sim` — `--crash-s`, `--restart-ms`, `--partition-s`, and `--unsafe-metadata`.
+  The result line now reports elections, terms, and `raft.state` fsyncs.
+- `tests/unit/test_raft_election.cpp` — 19 tests, **1 ms**, no infrastructure at all.
+  Includes the amnesia test that makes the fsync argument by construction, and
+  `WithoutJitterLockstepNodesSplitTheVoteForever`, which shows what the jitter is for.
+- `tests/simulation/test_raft_cluster.cpp` — elections under faults, clock jumps that
+  must not disturb them, the asymmetric-partition test §17 asks for by name, and
+  `OneKnobDecidesWhetherATermCanElectTwoLeaders` — the test that proves the I6 checker can
+  go red, because a check nobody has watched fail is not evidence. It pins the seed the
+  demo script uses, so the demo cannot go stale quietly;
+  `TheAmnesiaFailureIsNotOneCherryPickedSeed` carries the breadth.
+- `tests/support/build_mode.h` — instrumented builds run reduced sweeps. The sanitizer
+  presets are `Debug` (`-O0`), roughly 100× slower than `dev`, and seed *breadth* is a
+  logic argument that a deterministic simulation makes build-independent; what ASan and
+  UBSan need is the code *path*, which one seed reaches as well as forty.
+
+**Changed**
+- Ping/pong is gone from the simulated workload; Raft messages exercise the transport
+  instead, and better. Each node still appends to its own log independently — those
+  appends are not proposals and are not replicated yet — which keeps I1 and I2 under
+  continuous test while elections stabilize. Turning them into Raft entries is week 5.
+- Raft messages always leave over the sender's *own* connection to the target, never as a
+  reply on the connection a request arrived on. Replying inbound would have quietly made
+  every partition symmetric in practice while looking asymmetric in the config.
+
+**Fixed**
+- **TSAN no longer runs the simulation tests** — ER-5 enforced rather than merely written
+  down. The `tsan` configure preset has said "real runtime only; useless in sim" in its
+  display name since week 1, but nothing implemented it, so TSAN had been spending its
+  time on a simulator that is single-threaded by construction and has no data race to
+  find. Week 3 absorbed that as a 248 s run and raised a timeout; week 4 added ticks,
+  heartbeats and an fsync per vote, and it became two 600 s timeouts and a 30-minute job.
+  The simulation tests now carry a `simulation` label that the `tsan` test preset
+  excludes. **TSAN: 1828 s with 2 timeouts → 7.6 s, 18/18.** They remain fully covered by
+  ASAN and UBSAN, which are the sanitizers that can find something there.
+- **The hard-state debt is sticky.** `take_ready()` used to clear the needs-persisting
+  flag as it handed the state over, i.e. before anything was on disk. A failed fsync then
+  left the node with a vote it believed it had recorded: the candidate's retry is granted,
+  nothing changed so nothing asks for a write, and the grant goes out over a vote that
+  never reached the platter. Both halves were individually correct; the composition
+  violated §13. Now only `hard_state_persisted()` clears it, and the driver calls that
+  after the fsync returns. Found by review, not by the simulator — `retrospective.md` §5.
+- **A repeat vote for the same candidate no longer re-fsyncs.** Granting used to mark the
+  state dirty unconditionally, so a candidate retrying every election timeout cost one
+  `raft.state` fsync per retry — a stall on the durability path exactly when the cluster
+  is already struggling. Only an actual change owes a write.
+- **Bug journal #2** — one cut link between two of three nodes made leadership ping-pong
+  every ~200 ms for the entire partition: 28 elections in 40 simulated seconds, 4228
+  across a 30-seed sweep. A follower that could still hear the leader was granting votes
+  to the node that could not, deposing a leader it was talking to. Fixed with the Raft
+  dissertation's §4.2.3 rule; 28 → 2 on the same seed. **No invariant fired** — I1–I6 all
+  held throughout, which is the interesting part.
+
+**Known and deferred**
+- **Pre-Vote is not implemented.** The lease rule stops the livelock but a node behind a
+  cut link still campaigns into the void, so its term climbs — 81 terms against 1 election
+  in a 40 s run — and it disrupts the healthy leader once on heal. Week 5.
+- **No liveness invariant.** I1–I6 are all safety properties and are satisfied by a
+  cluster that does nothing. This is what let bug #2 hide behind 1000 green seeds, and
+  week 5 owes a conditional liveness check: over a window in which some majority stayed
+  connected, a leader existed for most of it.
+- **No check-quorum.** A leader isolated from its followers keeps believing it is leader.
+  Harmless while it cannot commit; it matters in week 5, when a stale leader could serve
+  a read.
+
 ### Week 3 — Simulator core · 2026-08-14
 
 Demo ran. `scripts/demo_week3.sh`: one seed twice → byte-identical traces; one simulated

@@ -10,24 +10,23 @@ lands; update the rules only when a rule actually changes.
 
 ## Status
 
-- **Phase:** week 3 done — simulator core (`sim/` + `io/sim/`): virtual clock, seeded
-  scheduler, sim disk/network, trace hash. 17 test binaries green under
-  dev/asan/ubsan/tsan. `scripts/demo_week3.sh` ran. **Bug journal has its first entry.**
-- **Next:** weeks 4–5 — Raft: election → replication → persistence, under fault
-  injection. Decide `tick()`-driven vs self-timed first. Demo: 1000 seeds green in CI;
-  ≥ 3 bug-journal entries.
-- **⚠ End of week 5:** provision benchmark VMs (`project_spec.md` §24) — student-pack
-  approval takes days, and week 6's deploy script has nothing to target without it.
+- **Phase:** weeks 4–6 + 8 done. `server::Broker` is the one driver — `sim/` **owns** one
+  and never copies it. `bench/run_all.sh` gives every number from one command; NFR-3 passes
+  (failover p99 489 ms). **Journal has 3; criterion 4 done; 1, 5, 7 ◐.**
+- **Next:** (1) run `bench/run_all.sh` on GCP for README numbers, (2) implement §13.1's
+  **group commit** — specced, never built, one fsync per append caps throughput at the
+  device flush rate — and measure it as §19 #5's before/after. Then `client/`.
+- **Benchmark VMs:** GCP is available, so §24 is no longer a blocking dependency.
 
 ## Non-negotiable rules
 
 1. **The one rule (ER-1).** Nothing in `storage/`, `raft/`, `server/`, `client/` touches
-   the OS. No `<chrono>` clocks, sockets, file I/O, `rand()`, `std::thread`. Everything
-   goes through an `io/` interface injected at construction. CI greps for violations.
-   This is what makes the simulator possible — if a change seems to need an exception,
-   the design is wrong, not the rule.
+   the OS — no `<chrono>` clocks, sockets, file I/O, `rand()`, `std::thread`. Everything
+   goes through an `io/` interface injected at construction; CI greps for violations. If
+   a change seems to need an exception, the design is wrong, not the rule. (`raft/` goes
+   further: no `io/` at all except `Random`. It counts ticks; the driver acts.)
 2. **Determinism (ER-2).** No `unordered_map`/`unordered_set` iteration in simulated
-   paths. No pointer-value-dependent ordering. No uninitialized reads. The trace-hash
+   paths, no pointer-value-dependent ordering, no uninitialized reads. The trace-hash
    test is the canary, not discipline.
 3. **Never assume dense offsets.** Control records occupy real offsets and are filtered
    from fetch. Assert monotonicity, never density. Client must not compute
@@ -42,10 +41,8 @@ lands; update the rules only when a rule actually changes.
 ## Conventions
 
 - C++20, Clang 17+ primary / GCC 13 in CI. `-Wall -Wextra -Wconversion -Werror`.
-- Build via CMake presets, never raw `cmake` flags: `dev | release | asan | ubsan |
-  tsan | msan | fuzz`.
-- Errors are `u16` wire codes, classified retryable vs terminal. Per-*partition* in
-  responses, never per-connection.
+- Build via CMake presets, never raw flags: `dev|release|asan|ubsan|tsan|msan|fuzz`.
+- Errors are `u16` wire codes, retryable vs terminal. Per-*partition* in responses.
 - Little-endian on disk and wire. Every API versioned from v0.
 
 ## Living docs — update these as work lands, not at the end
@@ -59,23 +56,29 @@ lands; update the rules only when a rule actually changes.
 | `docs/retrospective.md` §2–11 | While confused, not after | Write the *wrong belief*, not just the fix. Details decay in ~48h |
 | `CLAUDE.md` (this file) | A rule actually changes | Keep under ~80 lines |
 
-The bug journal lives in `retrospective.md` §1 — there is no separate `bugs.md`, it is the
-most persuasive artifact in the repo, and it costs five minutes an entry. Do not skip it.
+The bug journal lives in `retrospective.md` §1 — no separate `bugs.md`. Most persuasive
+artifact in the repo, five minutes an entry. **A bug that broke no invariant still gets
+one** (see #2); the interesting ones increasingly will.
 
 ## Commands
 
 ```bash
 cmake --preset dev && cmake --build --preset dev -j   # build (also: asan|ubsan|tsan)
-ctest --preset dev                                    # 17 binaries, incl. the I7 canary
+ctest --preset dev                                    # 21 binaries, incl. the I7 canary
 ./scripts/check_one_rule.sh --self-test && ./scripts/check_one_rule.sh  # ER-1 guard
 ./build/dev/bench/echo --duration-s 5 --pipeline 32   # week 1 demo
-./scripts/demo_week2.sh ; ./scripts/demo_week3.sh     # week 2 + 3 demos
+./scripts/demo_week{2,3,4,5,6}.sh                     # weeks 2-6 demos
+BENCH_LOCAL=true ./bench/run_all.sh                    # every number, one command
+./build/dev/src/logengine --id 0 --port 9000 --dir d0 --peers 1@h:p,2@h:p
 ./build/dev/tools/log-dump <segment.log> --records    # read-only; never repairs
-./build/dev/tools/sim --seeds 500                     # fault sweep; prints node-hours
+./build/dev/tools/sim --seeds 1000                    # fault sweep; prints node-hours
 ./build/dev/tools/sim --seed X --dump-trace /tmp/t    # reproduce a failure exactly
+./build/dev/tools/sim --seed 2 --duration-s 60 --crash-s 4 --acks-1   # loses data (§13.2)
+./build/dev/tools/sim --seed 4 --unsafe-metadata \
+  --crash-s 3 --restart-ms 120                        # breaks I6 on demand (§13)
 ```
 
-Not built yet — week 4+: `tools/sim-replay`, `bench/run_all.sh`.
+Not built yet: `client/`. Cut: Prometheus/Grafana (FR-11).
 
 ## Working agreements
 

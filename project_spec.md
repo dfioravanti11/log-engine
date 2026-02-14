@@ -100,6 +100,21 @@ No general linearizability checker. These six concrete invariants run inside the
 
 Plus one meta-invariant, tested separately: **I7 — the same seed produces a byte-identical event trace** (see §14).
 
+**Added in week 5 — I8, liveness.** Every invariant above is a *safety* property, and a
+cluster that does nothing at all satisfies every one of them. That gap is not theoretical:
+it let a livelock hide behind a thousand green seeds for a week (`docs/retrospective.md`
+§1 entry #2), with the cluster electing a new leader every 200 ms and committing nothing.
+
+| # | Invariant |
+|---|---|
+| I8 | The cluster is never leaderless for longer than a bounded recovery time *once a majority can communicate* |
+
+It is stated conditionally because the unconditional version is false — during a partition
+that costs the majority, having no leader is correct. The simulator measures the longest
+leaderless stretch and the caller decides what is tolerable given the faults it injected.
+**"A leader exists" is not the invariant; "the cluster gets one back within a bounded time
+of being able to" is.**
+
 ## 7. Non-functional requirements
 
 | ID | Requirement | Target |
@@ -296,6 +311,13 @@ Raft's safety proof assumes stable storage. A node that votes in term T, crashes
 
 Batching fsyncs is where the throughput is. Two honest paths:
 
+**Status after week 8 — specified, not implemented.** `Broker::propose()` fsyncs per batch,
+so there is one device flush per Raft entry and no amortization at all. The benchmark is
+what surfaced it: median append-ack latency of 8.5 ms is one `F_FULLFSYNC`, and throughput
+flattens at ~1,228 records/s, which is the flush rate times the batch size and nothing to
+do with this code. It is the top of the optimization list and the intended subject of
+§19 #5's before/after measurement — the "before" is taken. See `docs/retrospective.md` §5.
+
 - **Chosen — delay the response, not the write.** Append to the page cache immediately; respond only after the next group fsync completes (every N ms or N bytes). Throughput comes from amortizing fsync across many in-flight appends, not from lying about durability.
 - **Documented alternative — explicit recovery protocol.** A node that may have lost unflushed writes rejoins as a *learner* with a fresh identity, refuses to vote until caught up past its pre-crash log end, and can't count toward quorum meanwhile. Roughly Viewstamped Replication's recovery protocol / TigerBeetle's storage-fault model. Described in the README as evaluated-and-rejected-for-scope.
 
@@ -456,6 +478,24 @@ u32 length | u16 api_key | u16 api_version | u32 correlation_id | payload
 | Silent disk corruption | CRC on read → refuse to serve, re-replicate from peer |
 | Unflushed writes lost on power loss | Modeled explicitly (§13) — where most student Raft gets it wrong |
 | Clock skew / jumps | Correctness never depends on wall clock. Monotonic time for timers; wall clock only for record timestamps, which are metadata, not ordering |
+
+**Amended in week 4 — the partition row was too narrow.** The livelock above was specced as
+an *asymmetric* partition problem. It is not: a plain symmetric cut of a single link
+between two of three nodes produces it just as reliably, because the third node can still
+reach both and will happily grant a vote to whichever peer has just lost contact with the
+leader. Leadership then alternates every election timeout for as long as the cut lasts —
+28 elections in 40 simulated seconds, with every invariant in §6 holding throughout
+(`docs/retrospective.md` §1 entry #2). The designed response is the Raft dissertation's
+§4.2.3 rule: a follower that has heard from its leader inside a full election timeout
+drops a `RequestVote` without answering and without adopting its term. **Pre-Vote is not
+yet implemented**, so a node behind a cut still inflates its own term and disrupts the
+leader once when the partition heals; that is week 5.
+
+The wider lesson belongs in §6 and is recorded here because it changes what the invariant
+set is for: **I1–I6 are all safety properties, and a cluster that does nothing satisfies
+every one of them.** No check in this document can distinguish a working system from a
+stopped one. Week 5 adds a conditional liveness invariant — over a window in which some
+majority stayed continuously connected, a leader existed for most of it.
 
 ## 18. Testing strategy
 
