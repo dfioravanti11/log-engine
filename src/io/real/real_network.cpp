@@ -68,7 +68,7 @@ ConnId conn_of(int fd) { return static_cast<ConnId>(fd); }
 
 }  // namespace
 
-RealNetwork::RealNetwork() {
+RealNetwork::RealNetwork(bool bind_all_interfaces) : bind_all_(bind_all_interfaces) {
   // A write to a closed peer must surface as EPIPE, not as a process-killing signal.
   ::signal(SIGPIPE, SIG_IGN);
 #if LOGENGINE_KQUEUE
@@ -117,7 +117,9 @@ base::Result<ConnId> RealNetwork::listen(base::u16 port, int backlog) {
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  // Loopback unless the deployment asked for otherwise — see the constructor. A three-VM
+  // benchmark is the only reason this is not hardcoded.
+  addr.sin_addr.s_addr = htonl(bind_all_ ? INADDR_ANY : INADDR_LOOPBACK);
   addr.sin_port = htons(port);
 
   if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||

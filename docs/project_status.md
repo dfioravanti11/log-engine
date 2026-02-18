@@ -13,10 +13,10 @@
 | | |
 |---|---|
 | **Phase** | **Week 8 complete.** `bench/run_all.sh` produces every number from one command. NFR-3 passes; the benchmark found that §13.1's group commit was specced and never built |
-| **Current focus** | Running the suite on GCP for README numbers, then implementing group commit as §19 #5's before/after |
+| **Current focus** | Running the suite on GCP for README numbers — procedure and tooling ready in `docs/benchmarking.md`, not yet executed — then implementing group commit as §19 #5's before/after |
 | **Last demo** | ☑ `bench/run_all.sh` — simulator totals, failover p50 178 / p99 489 ms, a saturation sweep, and the `acks` trade-off |
 | **This week's demo** | ☑ one command, every number, each with its conditions attached |
-| **Blockers** | None |
+| **Blockers** | None. Note: until now every "cluster" run in CI, the demos and the benchmarks was three processes on loopback — `RealNetwork` bound `INADDR_LOOPBACK`. `--bind-all` fixes it; the first genuinely multi-machine run will be the GCP one |
 | **Next decision due** | None open. Benchmark VMs are **no longer a risk** — GCP is available, so week 6 has somewhere to deploy without waiting on an approval |
 
 ### Decisions on the table

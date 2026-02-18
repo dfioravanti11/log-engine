@@ -15,7 +15,14 @@ namespace io::real {
 // through the MPSC queue in runtime/, not through shared network state.
 class RealNetwork final : public Network {
  public:
-  RealNetwork();
+  // `bind_all_interfaces` is the difference between a cluster on one machine and a
+  // cluster on three. It is a property of the deployment, not of a call, so it lives
+  // here rather than widening `Network::listen()` — which would push a detail of the
+  // real socket API through the seam and into io/sim/, where it means nothing.
+  //
+  // Defaults to loopback. A benchmark VM opts in with `logengine --bind-all`, so the
+  // laptop case can never accidentally expose a broker to the local network.
+  explicit RealNetwork(bool bind_all_interfaces = false);
   ~RealNetwork() override;
 
   RealNetwork(const RealNetwork&) = delete;
@@ -46,6 +53,7 @@ class RealNetwork final : public Network {
   base::Status register_fd(int fd);
 
   int poll_fd_ = -1;
+  bool bind_all_ = false;
   std::vector<Entry> entries_;  // indexed by fd; fds are small and dense
 
   // fds closed while dispatching the current poll batch. An event captured before

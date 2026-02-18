@@ -673,6 +673,45 @@ fails an election because it is *working too hard* is a nice illustration of why
 thread-per-core split matters, and it argues for taking the fsync off the loop that owns
 consensus timing.
 
+### Week 8 · Four weeks of "cluster" tests, and not one crossed a machine
+
+Setting up the GCP run, I went looking for how to point three brokers at three internal
+IPs and found that there is no how. `RealNetwork::listen()` binds `INADDR_LOOPBACK`. It
+has since week 1, when it was obviously correct and nobody was ever going to run this
+anywhere else.
+
+The wrong belief was not "the code binds all interfaces" — I had no belief about it at
+all. It was one level up: **I thought "distributed" was a property the system had, when
+it was a property nothing had ever tested.** CI runs a three-node cluster. The week 6 demo
+kills a real leader with `kill -9` and watches a real failover. `run_all.sh` sweeps a real
+three-broker cluster under real load. Every one of those is three processes on one machine
+talking to `127.0.0.1`, and every one of them passes, because a loopback cluster is a
+*working* cluster. It elects, replicates, commits, recovers. It is missing exactly one
+thing, and that thing is the network.
+
+This is the same shape as week 5's "the check passed because it wasn't checking", and it
+is getting to be a habit worth naming. The failure mode is never a test that goes red for
+the wrong reason. It is a test that goes green while quietly not exercising the axis you
+believe it covers — recovery that never read a corrupt page, an invariant set with no
+liveness property in it, a fault injector whose faults had stopped firing, and now a
+distributed systems project with no network in the loop. In every case the artifact
+*looked* more complete than it was, and in every case the thing that exposed it was
+changing the conditions rather than adding an assertion.
+
+The fix is ten lines and uninteresting. What I want to keep is the reason it stayed hidden
+for four weeks: **loopback is not a degraded network, it is a different one.** A latency of
+~20 µs and a loss rate of zero means every timing constant in Raft has enormous slack, so
+the parts of the design that exist *because* the network is slow and unreliable — the
+election timeout range, the rejection backoff, the pipelining of AppendEntries — were
+never under any pressure. The simulator did cover that axis, with delays and partitions and
+reordering, which is why the algorithm is in good shape. But the simulator drives
+`io/sim/`. The claim "the real binary is the same object" was proven at the seam in week 6,
+and I let it quietly extend to "and therefore the real binary has been tested over a real
+network", which does not follow and was not true.
+
+Cheap lesson, and only cheap because it surfaced before the numbers were published rather
+than after.
+
 ### Week 6 · The bet paid, and the payment was a diff
 
 Three weeks of this project rested on one claim: everything above the `io/` seam runs

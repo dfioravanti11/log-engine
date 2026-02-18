@@ -18,7 +18,10 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 BENCH_LOCAL="${BENCH_LOCAL:-false}"
-RATES="${RATES:-250 500 1000 2000 4000}"
+# `${RATES-...}` and not `${RATES:-...}`: the colon form treats empty as unset, which
+# would make `RATES= ./bench/run_all.sh` silently run the default sweep instead of
+# skipping it. Skipping is the whole point — see section 3.
+RATES="${RATES-250 500 1000 2000 4000}"
 RECORD_BYTES="${RECORD_BYTES:-1024}"
 BATCH="${BATCH:-16}"
 DURATION="${DURATION:-20}"
@@ -33,7 +36,7 @@ BASE_PORT=9500
 
 for exe in "$BIN" "$SIM" "$FAILOVER"; do
   [ -x "$exe" ] && continue
-  echo "Build first:  cmake --preset release && cmake --build --preset release -j"
+  echo "Build first:  cmake --preset dev && cmake --build --preset dev -j"
   echo "(missing: $exe)"
   exit 1
 done
@@ -85,6 +88,16 @@ echo
 hr
 echo "3. sustained throughput and append-ack latency  (§19 #1, #2, NFR-1, NFR-2)"
 hr
+if [ -z "${RATES// /}" ]; then
+  # `RATES= ./bench/run_all.sh` — the other three sections run on virtual time and are
+  # hardware independent, so this is how you collect them alongside a real cluster sweep
+  # from bench/run_gcp.sh without also running a meaningless loopback one.
+  echo "skipped: RATES is empty."
+  echo "The real-hardware version of this section is bench/run_gcp.sh, which runs one"
+  echo "broker per VM. Sections 1, 2 and 4 above are unaffected — they run on virtual"
+  echo "time, so this machine's hardware does not enter into them."
+  echo
+else
 echo "A sweep, not a single number. NFR-2 asks for a p99 *at 70% of measured saturation*,"
 echo "which means saturation has to be measured first — and the knee is the interesting"
 echo "part anyway: below it the tail is flat, above it the queue is the latency."
@@ -142,6 +155,7 @@ echo "  'terms' is the highest Raft term any node reached. It should stay at 1: 
 echo "  above that means the cluster was electing under load, which is a throughput"
 echo "  result too — the event loop starving its own Raft ticks."
 echo
+fi
 
 hr
 echo "4. durability trade-off  (§19 #6, §13.2)"

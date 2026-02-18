@@ -19,6 +19,55 @@
 
 ## [Unreleased]
 
+### Week 8 — three VMs, one broker each · 2026-08-16
+
+The benchmark harness could not produce a distributed number, and nothing in the repo
+said so. `RealNetwork::listen()` bound `INADDR_LOOPBACK` — every cluster this project has
+ever run, in CI, in the demos, and in `run_all.sh`'s throughput sweep, was three brokers
+on one machine talking to themselves. Correct for a laptop and invisible for four weeks,
+because a loopback cluster is a *working* cluster: it elects, replicates, commits and
+survives `kill -9`. It just isn't distributed.
+
+**Added**
+- `--bind-all` on `logengine`, plumbed as a `RealNetwork` constructor flag rather than a
+  new parameter on `Network::listen()`. Binding is a property of the deployment, not of a
+  call; widening the interface would have pushed a detail of the real socket API through
+  the seam into `io/sim/`, where it means nothing. Zero of the 16 existing `listen()` call
+  sites changed, and `io/sim/` did not change at all. Defaults to loopback, so the laptop
+  case cannot accidentally expose a broker.
+- `bench/run_gcp.sh` — §19 #1 and #2 across three VMs in one zone. Nodes rendezvous on a
+  shared wall-clock second before starting, because `gcloud ssh` connection skew is
+  seconds and variable, and it would otherwise land inside the measurement window as
+  throughput loss that has nothing to do with the code.
+- `bench/run_node.sh` — the same sweep with the orchestration removed, for a shell on each
+  VM and no gcloud on the laptop. Nodes derive an identical schedule from one `--start`
+  epoch, so the three pastes need only happen before the first rate is due, not together.
+  Testing it on one machine found a `pkill -f` scoped to the binary path rather than to
+  the node's own invocation — harmless on three VMs, and it killed the other two brokers
+  everywhere else. Now scoped by `--id` and `--port`; `run_gcp.sh` had the same line.
+- `scripts/gcp_setup.sh`, `scripts/gcp_conditions.sh` — provisioning and the §19
+  conditions block (kernel, CPU, filesystem, mount options, scheduler). `gcp_conditions.sh`
+  **exits non-zero if the data directory is tmpfs**: fsync there is a no-op, so a
+  throughput number measured on it is not optimistic, it is fictional.
+- `docs/benchmarking.md` — the full procedure, ~$1/hour, ~30 minutes.
+
+**Changed**
+- `bench/run_all.sh` — `RATES=` now skips the throughput sweep, so the three sections that
+  run on virtual time can be collected next to a real-hardware sweep without also running
+  a meaningless loopback one. This needed `${RATES-...}` rather than `${RATES:-...}`: the
+  colon form treats empty as unset, so the first version silently ran the default sweep
+  while reporting that it had skipped it.
+- `bench/run_all.sh` — the "Build first" hint said `--preset release` while the script
+  looks for binaries under `build/dev/`. Following the error message could not fix the
+  error.
+
+**Trials & tribulations**
+- The 500 GB disk in `docs/benchmarking.md` is not about space. GCP provisions PD
+  performance *per gigabyte* — pd-ssd gives 30 write IOPS/GB — so a default 100 GB disk
+  caps at 3,000 IOPS, and with §13.1's group commit still unimplemented (one fsync per
+  append) the sweep would have measured a billing tier and published it as a throughput
+  result. Found while reasoning about what the number would mean, not by running it.
+
 ### Week 8 — the benchmark suite · 2026-08-16
 
 `bench/run_all.sh` produces every number in one command, each with its conditions attached.

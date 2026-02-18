@@ -4,19 +4,19 @@ Replicated append-only log service in C++20 (Kafka's durable core), validated by
 deterministic fault simulator. Full spec: `project_spec.md` — read it before any
 design decision. This file holds only what must be true in *every* session.
 
-**Keep this file under ~80 lines.** It is always in context; bloat here is a tax on
-every turn. Detail belongs in `project_spec.md`. Update the Status block as work
-lands; update the rules only when a rule actually changes.
+**Keep this file under ~80 lines.** Always in context; bloat here taxes every turn. Detail
+belongs in `project_spec.md`. Update Status as work lands, rules only when one changes.
 
 ## Status
 
-- **Phase:** weeks 4–6 + 8 done. `server::Broker` is the one driver — `sim/` **owns** one
-  and never copies it. `bench/run_all.sh` gives every number from one command; NFR-3 passes
+- **Phase:** weeks 4–6 + 8 done. `server::Broker` is the one driver — `sim/` **owns** one and
+  never copies it. `bench/run_all.sh` gives every number from one command; NFR-3 passes
   (failover p99 489 ms). **Journal has 3; criterion 4 done; 1, 5, 7 ◐.**
-- **Next:** (1) run `bench/run_all.sh` on GCP for README numbers, (2) implement §13.1's
-  **group commit** — specced, never built, one fsync per append caps throughput at the
-  device flush rate — and measure it as §19 #5's before/after. Then `client/`.
-- **Benchmark VMs:** GCP is available, so §24 is no longer a blocking dependency.
+- **Next:** (1) the GCP benchmark — tooling + procedure ready in `docs/benchmarking.md`, not
+  yet run, (2) §13.1 **group commit** — specced, never built, one fsync per append caps
+  throughput at the device flush rate — as §19 #5's before/after. Then `client/`.
+- **Loopback:** brokers bind loopback unless given `--bind-all`. Every cluster run before
+  week 8 — CI, demos, `run_all.sh` — was three processes on one machine.
 
 ## Non-negotiable rules
 
@@ -56,9 +56,9 @@ lands; update the rules only when a rule actually changes.
 | `docs/retrospective.md` §2–11 | While confused, not after | Write the *wrong belief*, not just the fix. Details decay in ~48h |
 | `CLAUDE.md` (this file) | A rule actually changes | Keep under ~80 lines |
 
-The bug journal lives in `retrospective.md` §1 — no separate `bugs.md`. Most persuasive
-artifact in the repo, five minutes an entry. **A bug that broke no invariant still gets
-one** (see #2); the interesting ones increasingly will.
+The bug journal lives in `retrospective.md` §1 — no separate `bugs.md`. Five minutes an
+entry, most persuasive artifact in the repo. **A bug that broke no invariant still gets
+one** (see #2).
 
 ## Commands
 
@@ -68,14 +68,14 @@ ctest --preset dev                                    # 21 binaries, incl. the I
 ./scripts/check_one_rule.sh --self-test && ./scripts/check_one_rule.sh  # ER-1 guard
 ./build/dev/bench/echo --duration-s 5 --pipeline 32   # week 1 demo
 ./scripts/demo_week{2,3,4,5,6}.sh                     # weeks 2-6 demos
-BENCH_LOCAL=true ./bench/run_all.sh                    # every number, one command
-./build/dev/src/logengine --id 0 --port 9000 --dir d0 --peers 1@h:p,2@h:p
+BENCH_LOCAL=true ./bench/run_all.sh                   # every number, one command
+RATES= ./bench/run_all.sh                             # skip the sweep; ZONE=.. bench/run_gcp.sh
+./build/dev/src/logengine --id 0 --port 9000 --dir d0 --peers 1@h:p,2@h:p  # +--bind-all
 ./build/dev/tools/log-dump <segment.log> --records    # read-only; never repairs
 ./build/dev/tools/sim --seeds 1000                    # fault sweep; prints node-hours
 ./build/dev/tools/sim --seed X --dump-trace /tmp/t    # reproduce a failure exactly
 ./build/dev/tools/sim --seed 2 --duration-s 60 --crash-s 4 --acks-1   # loses data (§13.2)
-./build/dev/tools/sim --seed 4 --unsafe-metadata \
-  --crash-s 3 --restart-ms 120                        # breaks I6 on demand (§13)
+./build/dev/tools/sim --seed 4 --unsafe-metadata --crash-s 3 --restart-ms 120  # breaks I6
 ```
 
 Not built yet: `client/`. Cut: Prometheus/Grafana (FR-11).
@@ -87,5 +87,5 @@ Not built yet: `client/`. Cut: Prometheus/Grafana (FR-11).
   metadata controller → multi-partition (last resort).
 - **Never cut:** the simulator, the benchmarks, the README, the bug journal.
 - Benchmark numbers ship with hardware, kernel, fs, mount options, offered load, and the
-  exact command. A p99 without an offered load is meaningless. Publish bad numbers with
-  the explanation. `BENCH_LOCAL=true` results validate the harness and never reach the README.
+  exact command; a p99 without an offered load is meaningless. Publish bad numbers with the
+  explanation. `BENCH_LOCAL=true` and loopback results never reach the README.

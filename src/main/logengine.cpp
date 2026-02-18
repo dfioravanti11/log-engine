@@ -37,7 +37,9 @@ void usage() {
                "  --status-ms N      milliseconds between status lines (default 1000)\n"
                "  --duration-s N     exit after N seconds (default: run forever)\n"
                "  --bench-rate N     open-loop benchmark at N records/s\n"
-               "  --record-bytes N   record size for the benchmark (default 1024)\n");
+               "  --record-bytes N   record size for the benchmark (default 1024)\n"
+               "  --bind-all         listen on all interfaces, not just loopback\n"
+               "                     (required for a multi-machine cluster)\n");
 }
 
 // `1@127.0.0.1:9001,2@127.0.0.1:9002`
@@ -79,6 +81,7 @@ int main(int argc, char** argv) {
   base::u64 bench_rate = 0;
   base::u32 record_size = 1024;
   bool have_id = false;
+  bool bind_all = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -109,6 +112,8 @@ int main(int argc, char** argv) {
       record_size = static_cast<base::u32>(std::strtoul(argv[++i], nullptr, 10));
     } else if (arg == "--duration-s" && has_value) {
       duration_s = std::strtoll(argv[++i], nullptr, 10);
+    } else if (arg == "--bind-all") {
+      bind_all = true;
     } else if (arg == "-h" || arg == "--help") {
       usage();
       return 0;
@@ -125,7 +130,7 @@ int main(int argc, char** argv) {
   }
 
   io::real::RealClock clock;
-  io::real::RealNetwork network;
+  io::real::RealNetwork network(bind_all);
   io::real::RealDisk disk;
   // Seeded from the OS here, from the run seed in the simulator. Same interface, and the
   // only thing Raft uses randomness for is election-timeout jitter.
