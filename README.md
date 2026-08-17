@@ -1,36 +1,256 @@
 # log-engine
 
-A replicated append-only log — Kafka's durable core, in C++20 — validated by a
-deterministic fault simulator that can replay any failure from a seed.
+A replicated append-only log in C++20, the durable core of a system like Kafka. Three
+server processes (brokers) keep identical copies of a log. Clients append records, and
+once the system says "stored", the record survives crashes and leader changes. The
+unusual part is how it is tested: the whole cluster also runs inside a deterministic
+fault simulator, on a fake clock, fake disks, and a fake network, with crashes,
+partitions, and disk corruption injected on a schedule chosen by a random seed. Same
+seed in, identical run out, so every bug it finds replays exactly. The simulator and the
+real servers run the same code; only the I/O implementations differ.
 
-> **Status: week 6 of 9, in progress.** Transport, storage, the simulator, Raft
-> (elections and replication), and a **real three-process cluster** are built and tested.
-> What is not built: a client library, and the benchmark suite. Every section below marks what
-> is real and what is `[planned]`, because a README that describes the design as though it
-> were the implementation is the main way this kind of project misleads.
+**Status:** storage, Raft (elections and replication), the simulator, a real
+three-process cluster over TCP, and the benchmark suite are built. The throughput and
+latency numbers below come from three cloud VMs. Not built: the client library, group
+commit (designed, not implemented, and the main throughput limiter), and a Kafka
+comparison.
 
----
+## Quick start
 
-## 1. What and why
+Clang 17+ or GCC 13, CMake ≥ 3.24. Nothing else to install; GoogleTest is fetched.
 
-Most from-scratch Raft implementations can tell you the algorithm is right. Very few can
-tell you *their code* is right, because the interesting failures — a torn write, a node
-that forgets a vote, a partition that heals at exactly the wrong moment — are
-non-deterministic, rare, and gone by the time you look.
-
-So the deliverable here is not the log. It is the machine that makes the log's failures
-reproducible: every clock, socket, disk, and random number goes through an interface with
-a real implementation and a simulated one. Under simulation the whole cluster runs on one
-thread, on virtual time, driven by a single seed. **One simulated cluster-hour takes about
-two wall-clock seconds**, and any failure it finds replays exactly:
-
-```
-./build/dev/tools/sim --seed 3 --dump-trace /tmp/trace.txt
+```bash
+cmake --preset dev && cmake --build --preset dev -j   # build
+ctest --preset dev                                    # 21 test binaries
+./build/dev/tools/sim --seeds 1000                    # fault sweep, ~14 s, prints node-hours
 ```
 
-And it is not only a simulation. `scripts/demo_week6.sh` brings up three real processes
-over real TCP on real disks, `kill -9`s the leader, and checks that the commit index never
-moves backwards across the failover:
+A three-node cluster, one process per broker (`scripts/demo_week6.sh` does this and then
+`kill -9`s the leader):
+
+```bash
+./build/dev/src/logengine --id 0 --port 9000 --dir data/0 \
+    --peers 1@127.0.0.1:9001,2@127.0.0.1:9002 --produce
+# ... plus --id 1 and --id 2. Brokers bind loopback unless given --bind-all.
+```
+
+Other useful commands:
+
+```bash
+./scripts/demo_week2.sh ... demo_week6.sh             # one runnable demo per week
+./build/dev/tools/sim --seed X --dump-trace /tmp/t    # replay a failure exactly
+./build/dev/tools/log-dump <segment.log> --records    # inspect a segment; never repairs
+BENCH_LOCAL=true ./bench/run_all.sh                   # every benchmark, one command
+```
+
+Presets: `dev | release | asan | ubsan | tsan | msan | fuzz`.
+
+## What it does
+
+A producer appends batches of records to the log; each record gets an **offset**, a
+permanent position number, and consumers fetch from any offset. Three brokers each hold
+a full copy, coordinated by **Raft**, a consensus algorithm in which the brokers elect
+one **leader** that accepts all appends and replicates them to the other two. A record
+is **committed** once a majority (two of three, a **quorum**) holds it; if the leader
+dies, an election picks a new one from the brokers that are up to date.
+
+There are two durability knobs, and they are deliberately never conflated:
+
+- **Per-request `acks`.** With `acks=quorum+fsync` (the default), the append is
+  acknowledged only after a majority has the record on disk. **fsync** is the system
+  call that forces a write out of the OS cache onto the physical disk; without it,
+  "written" means "in memory somewhere". With `acks=1`, the leader answers as soon as
+  its own write is durable. That is faster and can lose acknowledged records when a
+  crash is badly timed. Neither is a bug; they are different promises, and the simulator
+  demonstrates the difference on demand (below).
+- **Raft's own metadata** (the current term, and which candidate this node voted for) is
+  fsynced before any response that changes it, always, not tunable. A node that forgets
+  its vote can vote twice in the same term and elect two leaders.
+
+Two design points worth knowing before reading the code:
+
+- **The user's log is the Raft log.** There is no separate command stream feeding a
+  state machine, which would write every record twice. Consumers are protected from
+  leader-change truncation by clamping fetch to the commit index: a record cannot be
+  read until it can no longer be un-written.
+- **Offsets are monotonic, not dense.** Raft writes internal control records into the
+  same log; they occupy real offsets and are filtered out of fetch responses. A client
+  must never compute `last_offset + 1`. This is Kafka's behavior too.
+
+## How it is tested
+
+### The one rule
+
+No file in `storage/`, `raft/`, `server/`, or `client/` may touch the operating system.
+No clocks, no sockets, no file I/O, no threads, no `rand()`. Every such need goes
+through one of four `io/` interfaces (`Clock`, `Network`, `Disk`, `Random`) handed in at
+construction. CI greps for violations, and the grep has a `--self-test` that plants a
+violation and checks the guard actually fires, because a check that cannot fail is not a
+check.
+
+The real binary constructs `io/real/` (epoll/kqueue sockets, `pwrite`, `fdatasync` or
+`F_FULLFSYNC`). The simulator constructs `io/sim/` (a virtual clock, in-memory disks and
+wires). Everything above that seam is the same code either way. Since week 6 the driver,
+`server::Broker`, exists exactly once: the simulator owns one and observes it through
+hooks that can watch but never decide, and `logengine` runs the same object on real
+sockets. The evidence the extraction was faithful: a 1,000-seed sweep produced
+byte-identical totals before and after the move (2,320,262 records, 7,205 crashes).
+
+That is the whole bet. The code the simulator has crashed thousands of times is the code
+that ships, not a sibling of it.
+
+`raft/` goes further than the rule requires: `raft::Node` holds no `io/` interface at
+all except `Random`. It counts ticks and returns a description of what it wants done
+(persist this, send that); the broker carries it out. I chose ticks over timers because
+it makes the state machine testable with no infrastructure (19 election tests run in
+1 ms as three objects and a message queue), and because a machine with no clock has no
+way to be confused by one: the simulator's clock-jump fault has no path into consensus.
+
+### The simulator
+
+The whole cluster runs on one thread, on virtual time. Faults are injected on a schedule
+drawn from the seed: crash/restart with loss of unflushed writes and torn (half-written)
+writes, per-operation disk errors, silent bit flips, symmetric and asymmetric network
+partitions, connection resets, and wall-clock jumps. Idle time is skipped, so 1,000
+seeds cover **50 simulated node-hours in 13.7 s** of wall clock. Determinism is a tested
+property, not a hope: every run emits an event trace, the trace is hashed, and a
+required CI check runs the same seed twice and compares. A failure prints its seed, and
+`--seed X --dump-trace` replays it exactly. No result is ever printed without its seed.
+
+An oracle outside the nodes (so it survives the crashes they don't) checks eight
+invariants after every event:
+
+| # | Invariant |
+|---|---|
+| I1 | An acknowledged write is never lost |
+| I2 | Offsets are monotonic in commit order (gaps allowed, density never assumed) |
+| I3 | No reordering within a partition |
+| I4 | A committed entry is never overwritten |
+| I5 | No consumer reads past the commit index (structural: fetch is clamped) |
+| I6 | At most one leader per term |
+| I7 | The same seed produces a byte-identical event trace (required CI check) |
+| I8 | Once a majority can communicate, a leader appears within a bounded time |
+
+I8 exists because I1–I7 are safety properties, and a cluster that does nothing satisfies
+all of them. That is not hypothetical; it is how bug #2 below hid behind a thousand
+green seeds.
+
+### Two runs you can do yourself
+
+The metadata fsync, on seed 4. Same seed, one flag:
+
+```
+$ ./build/dev/tools/sim --seed 4 --duration-s 120 --crash-s 3 --restart-ms 120
+raft                75 elections over 84 terms, 245 state fsyncs     <- green
+
+$ ./build/dev/tools/sim --seed 4 --duration-s 120 --crash-s 3 --restart-ms 120 --unsafe-metadata
+invariant:  I6
+detail:     term 18 has two leaders: node 0 and node 2
+```
+
+A node voted, crashed before the write reached the disk, restarted without the memory of
+it, and voted again in the same term. No bug in the algorithm; the fsync is the
+algorithm's precondition.
+
+The `acks` knob, on seed 2, with a crash every four simulated seconds:
+
+```
+$ ./build/dev/tools/sim --seed 2 --duration-s 60 --crash-s 4
+acked               1882 records over 939 batches
+faults              30 crashes, 2 partitions, 164 resets     <- every promise kept
+
+$ ./build/dev/tools/sim --seed 2 --duration-s 60 --crash-s 4 --acks-1
+invariant:  I1
+detail:     node 2: won an election without the committed prefix (1848, 1866)
+```
+
+With `acks=quorum+fsync`, all 1,882 acknowledged records survive thirty crashes. With
+`acks=1`, 18 acknowledged records are lost: the leader died before replicating them and
+a new leader was elected that had never seen them, correctly, by every rule in the
+paper. This is the clearest single result in the project.
+
+### The bug journal
+
+Every simulator-found bug gets an entry with its seed, the invariant it broke, the
+cause, and the fix commit: [`docs/retrospective.md` §1](docs/retrospective.md). Three
+entries so far:
+
+1. **Recovery deleted 320 acknowledged records because one read failed** (seed 1).
+   Recovery treated a transient disk read error like end-of-file and truncated everything
+   after it, then reported the destruction as a routine torn tail, at info level. Found
+   within 17 simulated seconds of enabling disk errors.
+2. **One cut link made leadership ping-pong for the whole partition** (seed 3). 28
+   elections in 40 simulated seconds while every invariant held, because a follower that
+   could still hear its leader kept granting votes to the node that couldn't. Fixed with
+   the Raft dissertation's §4.2.3 rule: 28 elections became 2. This entry is why I8
+   exists.
+3. **A follower reported its log length instead of what it had agreed to** (seed 11), so
+   the leader counted entries it had never seen toward a quorum and committed records
+   that existed nowhere. Caught by a leader-completeness check on its first simulated
+   hour.
+
+### Test layers
+
+| Layer | What | When |
+|---|---|---|
+| Unit | 21 binaries: CRC, framing, index, recovery, elections, replication | every commit |
+| Property | Segment recovery cut at every byte position; codec round-trips | every commit |
+| Fuzz | Batch decoder (libFuzzer) | `LOGENGINE_BUILD_FUZZERS=ON` |
+| Simulation | Full cluster + faults + invariant checker | 50 seeds per push, 1,000 locally |
+| Determinism | Same seed twice → identical trace hash | every commit, required |
+| Sanitizers | ASan + UBSan everywhere; TSan on the real runtime only (the simulator is single-threaded by construction) | CI matrix |
+
+## Results
+
+Methodology first. Every number here ships with its hardware, kernel, filesystem, batch
+size, and offered load, and `bench/run_all.sh` regenerates all of it from one command
+(`bench/run_gcp.sh` for the hardware section; the procedure is
+[`docs/benchmarking.md`](docs/benchmarking.md)). Load generation is **open-loop**: the
+issue schedule is fixed in advance and latency is measured from when a record was *due*,
+so a stall stays in the histogram instead of disappearing exactly when it matters (the
+closed-loop mistake known as coordinated omission). Numbers from loopback or from three
+brokers sharing one laptop never appear here; that is this project's own rule.
+
+### Throughput and latency
+
+Conditions: three GCE `n2-standard-4` VMs (Intel Xeon @ 2.80 GHz, 4 vCPU, 15.6 GiB), one
+broker each, one zone, 150 GB pd-ssd, ext4
+(`rw,relatime,discard,errors=remount-ro,commit=30`), kernel 6.17.0-1022-gcp. 1 KiB
+records, 16 per batch, `acks=quorum+fsync`, open-loop, 30 s per rate. The `terms` column
+is Raft's election counter: 1 means the cluster never held an election under load.
+
+| offered rec/s | achieved | MB/s | p50 ms | p99 ms | terms |
+|---|---|---|---|---|---|
+| 1,500 | 1,490 | 1.46 | 3.85 | 4.83 | 1 |
+| 2,000 | 1,985 | 1.94 | 3.79 | 4.77 | 1 |
+| 2,500 | 2,479 | 2.42 | 4.43 | 5.65 | 1 |
+| 3,000 | 2,980 | 2.91 | 3.60 | 4.50 | 1 |
+| 3,500 | 3,470 | 3.39 | 3.53 | 4.43 | 1 |
+| 4,000 | 3,970 | 3.88 | 3.96 | 7.29 | 1 |
+| 4,400 | 4,364 | 4.26 | 3.29 | 5.58 | 1 |
+| 4,600 | 4,573 | 4.47 | 5.53 | 7.30 | 1 |
+| 4,800 | 4,765 | 4.65 | 3.27 | 5.48 | 1 |
+| **5,000** | **4,969** | **4.86** | **3.18** | **5.25** | **1** |
+| 6,000 | — | — | 955 | 2,207 | **39** |
+
+Saturation is **4,969 records/s (4.9 MB/s)**: the cluster tracks offered load to within
+about 30 records/s all the way up, then collapses at 6,000. **p50** (median latency)
+stays between 3.2 and 5.5 ms across the entire clean range and barely moves with load.
+**p99** — the latency 99% of requests beat — at 70% of saturation (3,500 rec/s) is
+**4.43 ms**, against the project's 10 ms target. Pass.
+
+### Failover
+
+| | p50 | p99 | p99.9 | Conditions |
+|---|---|---|---|---|
+| Time to a new leader | **178 ms** | **489 ms** | 657 ms | 200 induced leader failures across 10 seeds, 3 nodes, a crash every 5 s; 900 ms bound (3× election timeout). Pass |
+
+Measured in the simulator, on virtual time, on purpose: every failure lands where a seed
+put it and any outlier replays exactly, where fifty real `kill -9`s land wherever the OS
+scheduler puts them and an interesting outlier is gone forever. The trade, stated
+plainly: this covers election, campaigning, and the vote round trip, and **excludes
+process restart and OS scheduling. A real cluster is slower.** `scripts/demo_week6.sh`
+shows one real failover end to end:
 
 ```
 leader elected: node 0 (term 1)
@@ -40,259 +260,101 @@ new leader: node 2 (term 2)
 committed now:             1116
 ```
 
-The broker in that cluster is the *same object* the simulator has been crashing for three
-weeks — the only difference is which `io::` implementations were constructed at startup.
-`[planned — week 8]` the same run as a GIF, with the throughput graph.
+### Simulator coverage
 
-## 2. Architecture
-
-```
-   producer ──┐                        ┌── Broker 0 (leader) ──┐
-              ├── binary proto / TCP ──┤                       │  Raft group
-   consumer ──┘                        ├── Broker 1 ───────────┤  per partition
-                                       └── Broker 2 ───────────┘
-                                                  │
-                              segment files + sparse index + raft.state
-```
-
-Everything above the `io/` seam is portable and runs byte-identically in production and in
-the simulator. That is the entire architectural bet.
-
-```
-┌──────────────────────────────────────────────────────────┐
-│ client/    producer · consumer                [planned]   │
-│ server/    broker ✓ · dispatch [planned]                  │
-│ raft/      election ✓ · replication ✓ · log matching ✓     │
-│ storage/   segment ✓ · sparse index ✓ · recovery ✓        │
-│ wire/      framing ✓ · codecs ✓ · versioning ✓            │
-│ runtime/   event loop ✓ · timers ✓                        │
-├──────────────────────────────────────────────────────────┤
-│ io/        Clock │ Network │ Disk │ Random    ← THE SEAM  │
-│            real/ ✓          sim/ ✓                        │
-└──────────────────────────────────────────────────────────┘
-```
-
-Full structure, dependency rules, and request paths: [`docs/architecture.md`](docs/architecture.md).
-
-## 3. Design decisions
-
-Each of these had a real alternative that lost. The full list, with the reasoning that
-produced them, is in [`project_spec.md`](project_spec.md) and
-[`docs/retrospective.md` §2](docs/retrospective.md).
-
-**The user's log *is* the Raft log.** The textbook layering — Raft as a command stream
-feeding a separate state machine — writes every record twice and needs its own snapshot
-mechanism. Replicating the log directly means a snapshot is just a retention boundary.
-The cost is four follow-on problems, and having answers to all four is the point: consumer
-visibility (fetch is clamped to the commit index), control records occupying real offsets
-(so offsets are monotonic but **not dense**, exactly like Kafka), per-batch leader epochs
-for divergence detection (KIP-101), and segment shipping in place of snapshot install.
-
-**Two durability knobs, never conflated.** Raft metadata (`currentTerm`, `votedFor`)
-fsyncs before *any* response that changes it — always, not tunable. User data follows the
-request's `acks`. Conflating them is the classic bug, and the simulator demonstrates it on
-demand: same seed, one knob, [§4](#4-correctness).
-
-**`raft::Node` touches nothing.** No clock, no disk, no socket — not even an injected one.
-It counts ticks and returns a description of what it wants done; the driver carries it out.
-A three-node election is therefore three objects and a message queue, so 19 election tests
-run in **1 ms** with no infrastructure at all; the persist-before-you-respond rule becomes
-structural rather than remembered, because the state machine cannot send; and a wall-clock
-jump has no route into consensus, which is a test rather than a claim.
-
-**Callback event loop, not coroutines.** Ergonomics, not capability, and the single most
-likely way to lose a week early. Revisitable behind the same interface if it ever becomes
-unreadable.
-
-## 4. Correctness
-
-Eight invariants are checked inside the simulator as it runs:
-
-| # | Invariant | Checked |
+| | Value | Conditions |
 |---|---|---|
-| I1 | An acked write is never lost | ✓ |
-| I2 | Offsets are monotonic in commit order (gaps allowed) | ✓ |
-| I3 | No reordering within a partition | ✓ via log matching (§5.3) |
-| I4 | A committed entry is never overwritten | ✓ a leader must hold the whole committed prefix |
-| I5 | No consumer reads an offset ≥ the commit index | ✓ structurally — fetch is clamped |
-| I6 | At most one leader per term | ✓ |
-| I7 | The same seed produces a byte-identical event trace | ✓ **required CI check** |
-| I8 | The cluster regains a leader within a bounded time of being able to | ✓ |
+| Fault sweep | 1,000 seeds, **50 simulated node-hours**, in 13.7 s wall clock | 60 s each, 3 nodes, crashes + partitions + clock jumps; 2.3 M records committed, 7,205 crashes survived |
+| Durability trade-off | `acks=quorum+fsync` keeps all **1,882**, `acks=1` loses **18** | seed 2, 60 simulated s, a crash every 4 s; same seed, one flag |
+| Bugs found | 3, each replayable from its seed | seeds 1, 3, 11; [the bug journal](docs/retrospective.md) |
 
-**I8 is there because the other seven could not see a broken cluster.** Every one of I1–I6
-is a *safety* property, and a cluster that does nothing at all satisfies all of them — which
-is exactly how the bug below hid behind a thousand green seeds. It is stated conditionally,
-because the unconditional version is false: during a partition that costs the majority,
-having no leader is correct.
+## What the numbers mean
 
-**One knob, one invariant, one seed.** The fsync of `currentTerm`/`votedFor` is the thing
-§13 says is never tunable. Here is why, on seed 4:
+**The pipeline is one batch deep, and that explains everything else.** At the top clean
+rate the cluster commits 312.5 batches/s and each batch takes 3.183 ms end to end.
+Multiply them (Little's law) and you get 0.99: exactly one batch is ever in flight. Each
+batch is proposed, flushed, replicated, and committed before the next one starts.
+Nothing overlaps. So the flat p50 was never headroom, it was a service time, and the
+maximum throughput did not have to be discovered by pushing until something broke: it is
+just 1 ÷ latency, derivable from the first clean row of the table. One batch of 16
+records per 3.2 ms is 5,000 records/s. The run at 6,000 was confirmation.
+
+Two fixes follow, and they are independent ceilings that multiply rather than one:
+
+1. **Group commit** (designed, not implemented). Every append currently costs one
+   synchronous fsync, so the 3.2 ms is mostly one device flush. Batching flushes across
+   in-flight appends shrinks the 3.2 ms. This gap is the main reason throughput is where
+   it is, and no correctness test could ever have found it; it took a measurement.
+2. **Pipelining AppendEntries.** Even with a faster flush, one-at-a-time serialization
+   caps throughput at 1 ÷ latency. Letting batches overlap removes that limit.
+
+**Past the limit it collapses rather than degrading.** At 6,000 records/s the leader is
+so busy with synchronous disk flushes that it misses its own heartbeat deadlines, the
+followers conclude it is dead, and the cluster spends the run electing instead of
+working: 39 elections in 30 seconds, 56 at 8,000. A broker that loses its leadership
+because it is working too hard is the argument for taking disk flushes off the thread
+that owns consensus timing.
+
+One platform note: p50 on Linux/pd-ssd is 3.2 ms against 8.5 ms for the same code on
+macOS/APFS. Most of that gap is `fdatasync` versus `F_FULLFSYNC`, not the hardware.
+
+### Caveats, which the numbers inherit
+
+- **The load generator runs inside the leader process**, on the same event loop as the
+  consensus code, because there is no client library yet. When it falls behind it
+  catches up in bursts of up to 64 appends, each with its own synchronous fsync. The
+  starvation effect is real; the severity above 6,000 records/s is partly the measuring
+  instrument.
+- **The saturation point is not a clean threshold.** Each rate starts a fresh cluster,
+  which must finish its startup election before the producer's backlog builds. Near the
+  knee that race is a coin flip: one sweep had 4,200 collapse while 4,400 through 5,000
+  ran clean above it. Rates well below the knee are repeatable from one run; rates near
+  it need several, and the honest output there is a failure rate.
+- **Until week 8, every "cluster" test ran on one machine.** The server bound only
+  loopback, so CI, the demos, and the benchmarks were all three processes talking to
+  `127.0.0.1`. Everything passed, because a loopback cluster is a working cluster; it
+  just has no network in it. Found while setting up the GCP run, fixed with
+  `--bind-all`, and the sweep above was the first genuinely multi-machine run.
+
+## What is not built
+
+- **The client library** (`client/`). Producing and consuming currently happen from a
+  generator built into the broker. This also blocks two planned measurements: consumer
+  fetch throughput and end-to-end produce-to-consume latency.
+- **Group commit.** Specified in `project_spec.md` §13.1, not implemented. The "before"
+  number is measured; the before/after is the next piece of work.
+- **A Kafka comparison** on identical hardware. Planned; without identical hardware and
+  identical offered load it would be a press release, so it waits.
+- **Deliberate non-goals:** multiple topics, cross-partition transactions, membership
+  changes, tiered storage, a Kafka-compatible wire protocol. Also deferred with their
+  costs measured: Pre-Vote (a partitioned node still inflates its term, 81 terms against
+  1 election in one 40 s run, and disrupts the leader once on heal) and check-quorum.
+  The full list with reasoning is `project_spec.md` §3.
+
+## Code layout
 
 ```
-$ ./build/dev/tools/sim --seed 4 --duration-s 120 --crash-s 3 --restart-ms 120
-raft                75 elections over 84 terms, 245 state fsyncs     ← green
-
-$ ./build/dev/tools/sim --seed 4 --duration-s 120 --crash-s 3 --restart-ms 120 --unsafe-metadata
-invariant:  I6
-detail:     term 18 has two leaders: node 0 and node 2
+src/
+  base/     slices, buffers, Result<T>, CRC32C, endian codecs — no dependencies
+  io/       the seam: Clock, Network, Disk, Random + real/ and sim/ implementations
+  runtime/  callback event loop with a timer heap
+  wire/     frame codec, API keys, versioning
+  storage/  segments, sparse index, batch format, crash recovery
+  raft/     the consensus state machine (ticks in, decisions out), raft.state file
+  server/   Broker — storage + raft + connections + the tick loop, the one driver
+  sim/      virtual-time scheduler, trace hashing, fault injection, the oracle
+  main/     logengine, the broker binary
+tools/      sim (the simulator CLI), log-dump (read-only segment inspector)
+bench/      run_all.sh, run_gcp.sh, the failover and echo benchmarks
+scripts/    weekly demos, the ER-1 guard, GCP provisioning
 ```
 
-A node voted, crashed before the write reached the platter, came back not remembering, and
-voted again in the same term. Two candidates, two majorities, one term — with no bug
-anywhere in the algorithm.
+Dependencies point strictly downward; `sim/` depends on `server/` and never the
+reverse. Full structure and request paths: [`docs/architecture.md`](docs/architecture.md).
 
-And the same treatment for user data — the knob a producer actually sets. Seed 2, sixty
-simulated seconds, a crash every four:
-
-```
-$ ./build/dev/tools/sim --seed 2 --duration-s 60 --crash-s 4
-acked               1882 records over 939 batches
-faults              30 crashes, 2 partitions, 164 resets     ← every promise kept
-
-$ ./build/dev/tools/sim --seed 2 --duration-s 60 --crash-s 4 --acks-1
-invariant:  I1
-detail:     node 2: won an election without the committed prefix (1848, 1866)
-at:         56.902290 simulated seconds
-```
-
-Eighteen records the producer was told were safe, on a leader that died before replicating
-them; a new leader was elected that had never seen them, correctly, by every rule in the
-paper. **Neither setting is a bug.** They are different promises, and the simulator holds
-the system to whichever one it made.
-
-### The bug journal
-
-Every simulator-found bug gets an entry with its seed, the invariant it broke, the cause,
-and the fix commit: [`docs/retrospective.md` §1](docs/retrospective.md). **3 entries so
-far**, and the second is the one worth reading:
-
-> One cut link between two of three nodes made leadership ping-pong every ~200 ms for the
-> entire partition — 28 elections in 40 simulated seconds — while **every invariant held
-> throughout**. I1–I6 are all safety properties, and a cluster that does nothing satisfies
-> every one of them. A thousand green seeds had nothing to say about a cluster that was
-> completely unavailable.
-
-A conditional liveness invariant is week 5's debt, and that entry is why.
-
-### Test layers
-
-| Layer | What | Where |
-|---|---|---|
-| Unit | 20 binaries — CRC, framing, index, recovery, elections, `raft.state` | every commit |
-| Property | Segment recovery cut at *every* byte position; codec round-trips | every commit |
-| Fuzz | Batch decoder (libFuzzer) | `LOGENGINE_BUILD_FUZZERS=ON` |
-| Simulation | Full cluster + faults + invariant checker | 50 seeds/push, sweeps locally |
-| Determinism | Same seed twice → identical trace hash | every commit, **required** |
-| Sanitizers | ASan + UBSan everywhere; TSan on the real runtime only (the simulator is single-threaded by construction) | matrix build |
-
-## 5. Benchmarks
-
-**Methodology before numbers, always.** Everything below comes from one command:
-
-```bash
-./bench/run_all.sh                  # a real 3-node cluster
-BENCH_LOCAL=true ./bench/run_all.sh # harness validation on one machine
-```
-
-It reports simulator totals, failover time, a throughput/latency sweep, and the durability
-trade-off, each with its conditions attached — hardware, filesystem, mount options, record
-size, batch size, `acks` setting, and the offered load next to every latency. A p99 without
-an offered load is not a weak measurement; it is not a measurement.
-
-**Load is generated open-loop.** A closed-loop producer — issue, wait for the ack, issue
-the next — stalls when the system stalls and simply stops sampling, so the stall disappears
-from the histogram exactly when it matters. That is coordinated omission. Here the issue
-schedule is fixed in advance and latency is measured from when a record was *due* to be
-sent, so a delay caused by the system stays in the number.
-
-### What is measured today
-
-| Measurement | Value | Conditions |
-|---|---|---|
-| **Failover time** (NFR-3) | **p50 178 ms · p99 489 ms · p99.9 657 ms** | 200 induced leader failures across 10 seeds, 3 nodes, a crash every 5 s. **PASS** against the 900 ms bound (3× election timeout) |
-| Simulation coverage | 1000 seeds → 50 simulated node-hours in 13.7 s | 60 s each, 3 nodes, crashes + partitions + clock jumps; 2.3 M records committed, 7,205 crashes survived |
-| Distinct bugs found by the simulator | 3 | each replayable from a seed — [the bug journal](docs/retrospective.md) |
-| Echo RPC throughput | 1.46 M RPC/s, p50 22 µs / p99 38 µs | loopback, single core, 32-deep pipeline — **transport only, not a cluster** |
-
-Failover time is measured *in the simulator*, on virtual time, and that is a deliberate
-choice rather than a shortcut: fifty real `kill -9`s take minutes, land wherever the
-scheduler puts them, and produce a p99 that moves every run — and an interesting outlier is
-gone forever. Here every failure lands where a seed put it and replays exactly. The trade,
-stated plainly: it measures election + campaign + vote round trip and **excludes** process
-restart, page cache, and scheduler latency. The real cluster's number is larger, and
-`scripts/demo_week6.sh` shows one of them end to end.
-
-### What is not in this table yet, and why
-
-Sustained throughput and append-ack latency are **deliberately absent**. The harness
-produces them — the sweep runs, the numbers are consistent, the knee is clean — but every
-run so far has been three brokers sharing one laptop's CPU and one SSD, contending for the
-exact resources being measured. Those results validate the harness and by this project's
-own rule they never appear here. They go on real hardware next.
-
-What the local runs *did* establish is a design gap worth stating up front: **§13.1's group
-commit is specified and not implemented.** Every append currently costs one synchronous
-`fsync`, so throughput is pinned to the device's flush rate and the median latency is one
-`F_FULLFSYNC` rather than anything this code does. That is the top of the optimization list
-and the intended subject of the before/after measurement, with the "before" already taken.
-
-Also pending: a comparison against Kafka on identical hardware, consumer fetch throughput,
-and end-to-end produce→consume latency — the last two need a client library.
-
-## 6. What's not implemented, and why
-
-Deliberate non-goals, not omissions — the full list is `project_spec.md` §3.
-
-- **Multiple topics, partition rebalancing, a metadata controller.** One partition per Raft
-  group is the interesting problem; a controller is orchestration on top of it.
-- **Exactly-once transactions across partitions.** Idempotent produce within a partition is
-  in scope; cross-partition atomic commit is a second consensus protocol.
-- **Tiered storage, schema registry, ACLs, a wire-compatible Kafka client.** Each is a
-  product feature, not a distributed-systems problem.
-- **Membership changes.** Static config in v1. The design composes — joint consensus
-  encoded as control records — precisely because control records already exist.
-- **Pre-Vote and check-quorum.** Not yet. A node behind a cut link still inflates its term
-  (81 terms against 1 election, measured) and disrupts the leader once on heal; an isolated
-  leader keeps believing it is one. Both are recorded with their numbers rather than left
-  implicit, because "we knew and chose" and "we didn't notice" look identical six months
-  later.
-
-## 7. Build and run
-
-Clang 17+ or GCC 13 and CMake ≥ 3.24. Nothing else to install — GoogleTest is fetched, or
-used from the system if it is already there.
-
-```bash
-cmake --preset dev && cmake --build --preset dev -j   # build
-ctest --preset dev                                    # 20 test binaries
-./build/dev/tools/sim --seeds 1000                    # fault sweep; prints node-hours
-```
-
-Other presets: `release | asan | ubsan | tsan | msan | fuzz`.
-
-```bash
-./scripts/demo_week6.sh                # 3 real processes; kill -9 the leader; no loss
-./scripts/demo_week5.sh                # replication; acks=1 vs acks=quorum on one seed
-./scripts/demo_week4.sh                # elections under faults; breaks I6 on demand
-./build/dev/tools/sim --seed X --dump-trace /tmp/t    # replay a failure exactly
-./build/dev/tools/log-dump <segment.log> --records    # read-only; never repairs
-```
-
-A real three-node cluster, one process each:
-
-```bash
-./build/dev/src/logengine --id 0 --port 9000 --dir data/0 \
-    --peers 1@127.0.0.1:9001,2@127.0.0.1:9002 --produce
-```
-
-`scripts/demo_week6.sh` does all three and kills the leader. `[planned]` a `client/`
-library, so producing and consuming happen from outside a broker process rather than from
-the built-in generator.
-
----
-
-**Living documents**, written as the work happens rather than at the end:
+Living documents, written as the work happened rather than at the end:
 [status](docs/project_status.md) ·
 [changelog](docs/changelog.md) ·
 [architecture](docs/architecture.md) ·
-[retrospective + bug journal](docs/retrospective.md)
+[retrospective and bug journal](docs/retrospective.md) ·
+[benchmarking procedure](docs/benchmarking.md)
