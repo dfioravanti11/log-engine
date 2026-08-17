@@ -9,12 +9,6 @@ partitions, and disk corruption injected on a schedule chosen by a random seed. 
 seed in, identical run out, so every bug it finds replays exactly. The simulator and the
 real servers run the same code; only the I/O implementations differ.
 
-**Status:** storage, Raft (elections and replication), the simulator, a real
-three-process cluster over TCP, and the benchmark suite are built. The throughput and
-latency numbers below come from three cloud VMs. Not built: the client library, group
-commit (designed, not implemented, and the main throughput limiter), and a Kafka
-comparison.
-
 ## Quick start
 
 Clang 17+ or GCC 13, CMake ≥ 3.24. Nothing else to install; GoogleTest is fetched.
@@ -164,30 +158,6 @@ invariant:  I1
 detail:     node 2: won an election without the committed prefix (1848, 1866)
 ```
 
-With `acks=quorum+fsync`, all 1,882 acknowledged records survive thirty crashes. With
-`acks=1`, 18 acknowledged records are lost: the leader died before replicating them and
-a new leader was elected that had never seen them, correctly, by every rule in the
-paper. This is the clearest single result in the project.
-
-### The bug journal
-
-Every simulator-found bug gets an entry with its seed, the invariant it broke, the
-cause, and the fix commit: [`docs/retrospective.md` §1](docs/retrospective.md). Three
-entries so far:
-
-1. **Recovery deleted 320 acknowledged records because one read failed** (seed 1).
-   Recovery treated a transient disk read error like end-of-file and truncated everything
-   after it, then reported the destruction as a routine torn tail, at info level. Found
-   within 17 simulated seconds of enabling disk errors.
-2. **One cut link made leadership ping-pong for the whole partition** (seed 3). 28
-   elections in 40 simulated seconds while every invariant held, because a follower that
-   could still hear its leader kept granting votes to the node that couldn't. Fixed with
-   the Raft dissertation's §4.2.3 rule: 28 elections became 2. This entry is why I8
-   exists.
-3. **A follower reported its log length instead of what it had agreed to** (seed 11), so
-   the leader counted entries it had never seen toward a quorum and committed records
-   that existed nowhere. Caught by a leader-completeness check on its first simulated
-   hour.
 
 ### Test layers
 
@@ -315,21 +285,6 @@ macOS/APFS. Most of that gap is `fdatasync` versus `F_FULLFSYNC`, not the hardwa
   `127.0.0.1`. Everything passed, because a loopback cluster is a working cluster; it
   just has no network in it. Found while setting up the GCP run, fixed with
   `--bind-all`, and the sweep above was the first genuinely multi-machine run.
-
-## What is not built
-
-- **The client library** (`client/`). Producing and consuming currently happen from a
-  generator built into the broker. This also blocks two planned measurements: consumer
-  fetch throughput and end-to-end produce-to-consume latency.
-- **Group commit.** Specified in `project_spec.md` §13.1, not implemented. The "before"
-  number is measured; the before/after is the next piece of work.
-- **A Kafka comparison** on identical hardware. Planned; without identical hardware and
-  identical offered load it would be a press release, so it waits.
-- **Deliberate non-goals:** multiple topics, cross-partition transactions, membership
-  changes, tiered storage, a Kafka-compatible wire protocol. Also deferred with their
-  costs measured: Pre-Vote (a partitioned node still inflates its term, 81 terms against
-  1 election in one 40 s run, and disrupts the leader once on heal) and check-quorum.
-  The full list with reasoning is `project_spec.md` §3.
 
 ## Code layout
 
